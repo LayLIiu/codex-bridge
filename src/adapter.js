@@ -1,0 +1,465 @@
+const CHAT_ROLES = new Set(["system", "developer", "user", "assistant"]);
+const NATIVE_TOOL_TYPES = new Set([
+  "web_search",
+  "web_search_preview",
+  "image_generation",
+  "code_interpreter",
+  "computer_use_preview",
+  "file_search"
+]);
+
+export class UnsupportedNativeToolError extends Error {
+  constructor(tool) {
+    super(`原生工具 ${tool?.type ?? "unknown"} 不能直接转接到 Chat Completions function tool`);
+    this.name = "UnsupportedNativeToolError";
+    this.tool = tool;
+  }
+}
+
+export function toChatCompletionsRequest(responsesRequest, options = {}) {
+  if (!responsesRequest || typeof responsesRequest !== "object") {
+    throw new TypeError("请求体必须是对象");
+  }
+
+  if (responsesRequest.previous_response_id || responsesRequest.conversation) {
+    throw new Error("检测到 previous_response_id/conversation。当前适配器只支持 stateless 完整上下文请求。");
+  }
+
+  const warnings = [];
+  const tools = mapTools(responsesRequest.tools ?? [], {
+    onUnsupportedNativeTool: options.onUnsupportedNativeTool ?? "warn",
+    warnings
+  });
+
+  const chatRequest = {
+    model: options.modelOverride ?? responsesRequest.model,
+    messages: normalizeInputToMessages(responsesRequest.input ?? []),
+    store: false,
+    thinking: { type: "disabled" }
+  };
+
+  if (tools.length > 0) {
+    chatRequest.tools = tools;
+    chatRequest.tool_choice = mapToolChoice(responsesRequest.tool_choice);
+  }
+
+  copyKnownGenerationOptions(responsesRequest, chatRequest);
+
+  return { chatRequest, warnings };
+}
+
+export function fromChatCompletionsResponse(chatResponse) {
+  const choice = chatResponse?.choices?.[0];
+  const message = choice?.message ?? {};
+  const output = [];
+
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    for (const toolCall of message.tool_calls) {
+      if (toolCall.type !== "function") continue;
+      output.push({
+        type: "function_call",
+        id: toolCall.id,
+        call_id: toolCall.id,
+        name: toolCall.function?.name,
+        arguments: toolCall.function?.arguments ?? "{}",
+        status: "completed"
+      });
+    }
+  }
+
+  if (typeof message.content === "string" && message.content.length > 0) {
+    output.push({
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: message.content }]
+    });
+  }
+
+  return {
+    id: chatResponse?.id,
+    object: "response",
+    created_at: chatResponse?.created,
+    model: chatResponse?.model,
+    output,
+    usage: normalizeUsage(chatResponse?.usage),
+    finish_reason: choice?.finish_reason
+  };
+}
+
+function normalizeUsage(usage) {
+  if (!usage) return undefined;
+  return {
+    input_tokens: usage.prompt_tokens ?? usage.input_tokens ?? 0,
+    output_tokens: usage.completion_tokens ?? usage.output_tokens ?? 0,
+    total_tokens: usage.total_tokens ?? 0
+  };
+}
+
+// ---- 流式转换：Chat Completions SSE delta → Responses API SSE 事件 ----
+
+/**
+ * 创建一个流式转换器，把 Chat Completions 的 SSE delta 分片累积并转为
+ * Responses API 的 SSE 事件数组。每次调用 processChunk 返回本次新产生的事件。
+ */
+export function createStreamConverter(responseId, model) {
+  let started = false;
+  let outputIndex = 0;
+  let textItemActive = false;
+  let textContentIndex = 0;
+  let sequenceNumber = 0;
+  let accumulatedText = "";
+
+  // 按 tool call index 跟踪累积状态
+  const toolCallStates = new Map(); // index → { id, name, args }
+
+  function flush(events) {
+    const result = events.splice(0);
+    return result;
+  }
+
+  function seq(event) {
+    event.sequence_number = sequenceNumber++;
+    return event;
+  }
+
+  return {
+    processChunk(chunk) {
+      const events = [];
+      const choice = chunk?.choices?.[0];
+      const delta = choice?.delta;
+      const finishReason = choice?.finish_reason;
+
+      if (!started) {
+        events.push(seq({
+          type: "response.created",
+          response: {
+            id: responseId,
+            object: "response",
+            model,
+            status: "in_progress",
+            output: []
+          }
+        }));
+        events.push(seq({
+          type: "response.in_progress",
+          response: {
+            id: responseId,
+            object: "response",
+            model,
+            status: "in_progress",
+            output: []
+          }
+        }));
+        started = true;
+      }
+
+      // 文本内容（兼容 GLM-5 等使用 reasoning_content 的模型）
+      const textDelta = delta?.content || delta?.reasoning_content;
+      if (textDelta) {
+        accumulatedText += textDelta;
+        if (!textItemActive) {
+          events.push(seq({
+            type: "response.output_item.added",
+            output_index: outputIndex,
+            item: {
+              type: "message",
+              id: `${responseId}_msg`,
+              role: "assistant",
+              status: "in_progress",
+              content: []
+            }
+          }));
+          events.push(seq({
+            type: "response.content_part.added",
+            output_index: outputIndex,
+            content_index: textContentIndex,
+            part: { type: "output_text", text: "" }
+          }));
+          textItemActive = true;
+        }
+        events.push(seq({
+          type: "response.output_text.delta",
+          output_index: outputIndex,
+          content_index: textContentIndex,
+          delta: textDelta
+        }));
+      }
+
+      // 工具调用
+      if (Array.isArray(delta?.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index ?? 0;
+
+          if (tc.id) {
+            // 新工具调用开始
+            toolCallStates.set(idx, {
+              id: tc.id,
+              name: tc.function?.name ?? "",
+              args: ""
+            });
+          }
+
+          const state = toolCallStates.get(idx);
+          if (!state) continue;
+
+          if (tc.function?.arguments) {
+            state.args += tc.function.arguments;
+          }
+
+          // 第一个分片到达时发出 output_item.added
+          if (!state.emitted) {
+            const itemOutputIndex = outputIndex + (textItemActive ? 1 : 0) + idx;
+            events.push(seq({
+              type: "response.output_item.added",
+              output_index: itemOutputIndex,
+              item: {
+                type: "function_call",
+                id: state.id,
+                call_id: state.id,
+                name: state.name,
+                arguments: "",
+                status: "in_progress"
+              }
+            }));
+            state.emitted = true;
+            state.itemOutputIndex = itemOutputIndex;
+          }
+
+          if (tc.function?.arguments) {
+            events.push(seq({
+              type: "response.function_call_arguments.delta",
+              output_index: state.itemOutputIndex,
+              delta: tc.function.arguments
+            }));
+          }
+        }
+      }
+
+      // 结束
+      if (finishReason) {
+        if (textItemActive) {
+          events.push(seq({
+            type: "response.output_text.done",
+            output_index: outputIndex,
+            content_index: textContentIndex,
+            text: accumulatedText
+          }));
+          events.push(seq({
+            type: "response.content_part.done",
+            output_index: outputIndex,
+            content_index: textContentIndex,
+            part: { type: "output_text", text: accumulatedText }
+          }));
+          events.push(seq({
+            type: "response.output_item.done",
+            output_index: outputIndex,
+            item: { type: "message", role: "assistant", status: "completed" }
+          }));
+        }
+
+        for (const [idx, state] of toolCallStates) {
+          if (!state.emitted) continue;
+          events.push(seq({
+            type: "response.function_call_arguments.done",
+            output_index: state.itemOutputIndex,
+            arguments: state.args
+          }));
+          events.push(seq({
+            type: "response.output_item.done",
+            output_index: state.itemOutputIndex,
+            item: {
+              type: "function_call",
+              id: state.id,
+              call_id: state.id,
+              name: state.name,
+              arguments: state.args,
+              status: "completed"
+            }
+          }));
+        }
+
+        const outputItems = [];
+        if (accumulatedText) {
+          outputItems.push({
+            type: "message",
+            id: `${responseId}_msg`,
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: accumulatedText }]
+          });
+        }
+        for (const [idx, state] of toolCallStates) {
+          outputItems.push({
+            type: "function_call",
+            id: state.id,
+            call_id: state.id,
+            name: state.name,
+            arguments: state.args,
+            status: "completed"
+          });
+        }
+
+        events.push(seq({
+          type: "response.completed",
+          response: {
+            id: responseId,
+            object: "response",
+            model,
+            status: "completed",
+            output: outputItems,
+            usage: normalizeUsage(chunk?.usage)
+          }
+        }));
+      }
+
+      return flush(events);
+    }
+  };
+}
+
+export function normalizeInputToMessages(input) {
+  const items = Array.isArray(input) ? input : [input];
+  const messages = [];
+
+  for (const item of items) {
+    if (typeof item === "string") {
+      messages.push({ role: "user", content: item });
+      continue;
+    }
+
+    if (!item || typeof item !== "object") continue;
+
+    if (item.type === "message" || CHAT_ROLES.has(item.role)) {
+      messages.push({
+        role: normalizeRole(item.role),
+        content: normalizeContent(item.content)
+      });
+      continue;
+    }
+
+    if (item.type === "function_call") {
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: item.call_id ?? item.id,
+            type: "function",
+            function: {
+              name: item.name,
+              arguments: stringifyArguments(item.arguments)
+            }
+          }
+        ]
+      });
+      continue;
+    }
+
+    if (item.type === "function_call_output") {
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id ?? item.tool_call_id,
+        content: stringifyToolOutput(item.output)
+      });
+    }
+  }
+
+  return messages;
+}
+
+export function mapTools(responseTools, { onUnsupportedNativeTool = "warn", warnings = [] } = {}) {
+  const tools = [];
+
+  for (const tool of responseTools) {
+    if (!tool || typeof tool !== "object") continue;
+
+    if (tool.type === "function") {
+      tools.push({
+        type: "function",
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters ?? { type: "object", properties: {} },
+          ...(tool.strict === undefined ? {} : { strict: tool.strict })
+        }
+      });
+      continue;
+    }
+
+    if (NATIVE_TOOL_TYPES.has(tool.type)) {
+      if (onUnsupportedNativeTool === "error") {
+        throw new UnsupportedNativeToolError(tool);
+      }
+      warnings.push(`已跳过原生工具 ${tool.type}：Chat Completions 不能直接本地调度该类工具，请替换为 function tool。`);
+      continue;
+    }
+
+    warnings.push(`已跳过未知工具 ${tool.type ?? "unknown"}。`);
+  }
+
+  return tools;
+}
+
+function mapToolChoice(toolChoice) {
+  if (!toolChoice || toolChoice === "auto") return "auto";
+  if (toolChoice === "none") return "none";
+  if (toolChoice === "required") return "required";
+  if (typeof toolChoice === "object" && toolChoice.type === "function") {
+    return {
+      type: "function",
+      function: { name: toolChoice.name ?? toolChoice.function?.name }
+    };
+  }
+  return "auto";
+}
+
+function normalizeRole(role) {
+  if (role === "developer") return "system";
+  if (CHAT_ROLES.has(role)) return role;
+  return "user";
+}
+
+function normalizeContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      if (typeof part.text === "string") return part.text;
+      if (typeof part.input_text === "string") return part.input_text;
+      if (typeof part.output_text === "string") return part.output_text;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function stringifyArguments(args) {
+  if (typeof args === "string") return args;
+  return JSON.stringify(args ?? {});
+}
+
+function stringifyToolOutput(output) {
+  if (typeof output === "string") return output;
+  return JSON.stringify(output ?? "");
+}
+
+function copyKnownGenerationOptions(source, target) {
+  const keys = [
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "max_completion_tokens",
+    "presence_penalty",
+    "frequency_penalty",
+    "seed",
+    "stop",
+    "user"
+  ];
+
+  for (const key of keys) {
+    if (source[key] !== undefined) target[key] = source[key];
+  }
+}

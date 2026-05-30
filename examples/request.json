@@ -1,0 +1,36 @@
+{
+  "model": "gpt-4.1-mini",
+  "store": false,
+  "input": [
+    {
+      "type": "message",
+      "role": "system",
+      "content": "你是 Codex runtime 前置适配层。需要查证、读取文件或执行命令时，必须返回结构化 function tool call。"
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": "列出当前目录文件。"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "shell",
+      "description": "在本地执行只读 shell 命令，并返回 stdout/stderr。",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cmd": {
+            "type": "string",
+            "description": "要执行的命令"
+          }
+        },
+        "required": ["cmd"]
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}
