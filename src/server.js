@@ -161,7 +161,7 @@ export async function handleRequest(request, response, config) {
   }
 
   const modelOverride = config.modelOverride ?? config.model;
-  const { chatRequest, warnings, conversationId } = toChatCompletionsRequest(responsesRequest, {
+  const { chatRequest, warnings, conversationId, toolContext } = toChatCompletionsRequest(responsesRequest, {
     modelOverride,
     onUnsupportedNativeTool: config.strictNativeTools ? "error" : "warn",
     enableReasoning: config.enableReasoning,
@@ -247,7 +247,7 @@ export async function handleRequest(request, response, config) {
 
   // ── 转发请求 ──
   if (responsesRequest.stream) {
-    return handleStreamRequest(request, response, config, chatRequest, warnings, sessionId, turnId);
+    return handleStreamRequest(request, response, config, chatRequest, warnings, sessionId, turnId, toolContext);
   }
 
   // 非流式（带连接重试）
@@ -275,7 +275,8 @@ export async function handleRequest(request, response, config) {
     responseId: makeResponseId(),
     repairTextToolCalls: config.repairTextToolCalls ?? true,
     availableToolNames: getChatToolNames(chatRequest),
-    availableTools: chatRequest.tools ?? []
+    availableTools: chatRequest.tools ?? [],
+    toolContext
   });
   if (warnings.length > 0) {
     responsesBody.bridge_warnings = warnings;
@@ -316,7 +317,8 @@ export async function handleRequest(request, response, config) {
           responseId: makeResponseId(),
           repairTextToolCalls: config.repairTextToolCalls ?? true,
           availableToolNames: toolNames,
-          availableTools: chatRequest.tools ?? []
+          availableTools: chatRequest.tools ?? [],
+          toolContext
         });
         if (!responsesBody.bridge_warnings) responsesBody.bridge_warnings = [];
         responsesBody.bridge_warnings.push(`工具调用重试第 ${retryCount + 1} 次成功`);
@@ -345,8 +347,8 @@ export async function handleRequest(request, response, config) {
 
   // 写入 function_call
   for (const item of (responsesBody.output ?? [])) {
-    if (item.type === 'function_call') {
-      writeFunctionCall(sessionId, item.call_id, item.name, item.arguments);
+    if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      writeFunctionCall(sessionId, item.call_id, item.name, item.arguments ?? item.input ?? '');
       writeEvent(sessionId, 'tool_call', {
         turn_id: turnId,
         call_id: item.call_id,
@@ -384,7 +386,7 @@ export async function handleRequest(request, response, config) {
   writeJson(response, 200, responsesBody);
 }
 
-async function handleStreamRequest(request, response, config, chatRequest, warnings, sessionId, turnId) {
+async function handleStreamRequest(request, response, config, chatRequest, warnings, sessionId, turnId, toolContext) {
   chatRequest.stream = true;
   chatRequest.stream_options = { include_usage: true };
 
@@ -414,7 +416,7 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
   });
 
   const responseId = makeResponseId();
-  const converter = createStreamConverter(responseId, chatRequest.model, { enableReasoning: config.enableReasoning });
+  const converter = createStreamConverter(responseId, chatRequest.model, { enableReasoning: config.enableReasoning, toolContext });
 
   if (warnings.length > 0) {
     for (const w of warnings) {
@@ -467,9 +469,9 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
           }
 
           // 收集工具调用 — 从 output_item.added 拿 id 和 name
-          if (event.type === "response.output_item.added" && event.item?.type === "function_call") {
+          if (event.type === "response.output_item.added" && (event.item?.type === "function_call" || event.item?.type === "custom_tool_call")) {
             const callId = event.item.call_id ?? event.item.id;
-            toolCallMap.set(callId, { id: callId, name: event.item.name ?? "", arguments: "" });
+            toolCallMap.set(callId, { id: callId, name: event.item.name ?? "", arguments: "", type: event.item.type });
             writeEvent(sessionId, 'tool_call_started', {
               turn_id: turnId,
               call_id: callId,
@@ -478,7 +480,7 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
           }
 
           // 工具调用参数 delta
-          if (event.type === "response.function_call_arguments.delta") {
+          if (event.type === "response.function_call_arguments.delta" || event.type === "response.custom_tool_call_input.delta") {
             const callId = event.call_id ?? event.item?.call_id;
             if (callId && toolCallMap.has(callId)) {
               toolCallMap.get(callId).arguments += event.delta ?? event.arguments ?? "";
@@ -488,13 +490,15 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
           }
 
           // 工具调用参数完成
-          if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
+          if (event.type === "response.output_item.done" && (event.item?.type === "function_call" || event.item?.type === "custom_tool_call")) {
             const callId = event.item.call_id ?? event.item.id;
             if (callId && toolCallMap.has(callId)) {
               const tc = toolCallMap.get(callId);
               if (!tc.name && event.item.name) tc.name = event.item.name;
               if (event.item.arguments && tc.arguments !== event.item.arguments) {
                 tc.arguments = event.item.arguments;
+              } else if (event.item.input && tc.arguments !== event.item.input) {
+                tc.arguments = event.item.input;
               }
               writeEvent(sessionId, 'tool_call_completed', {
                 turn_id: turnId,

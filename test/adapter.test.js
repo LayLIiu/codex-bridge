@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createStreamConverter,
   fromChatCompletionsResponse,
+  buildCodexToolContext,
   mapTools,
   normalizeInputToMessages,
   stripHiddenReasoning,
@@ -338,17 +339,136 @@ test("把 Chat tool_calls 映射回 Responses function_call", () => {
   ]);
 });
 
-test("原生工具默认降级为 warning，严格模式报错", () => {
+test("Codex 内建工具默认转换为 function proxy，无法代理的原生工具严格模式报错", () => {
   const warnings = [];
   const tools = mapTools([{ type: "web_search" }], { warnings });
 
-  assert.deepEqual(tools, []);
-  assert.match(warnings[0], /已跳过原生工具 web_search/);
+  assert.equal(tools.length, 1);
+  assert.equal(tools[0].function.name, "web_search");
+  assert.match(warnings[0], /转换为 function proxy/);
 
   assert.throws(
     () => mapTools([{ type: "image_generation" }], { onUnsupportedNativeTool: "error" }),
     UnsupportedNativeToolError
   );
+});
+
+test("Codex custom apply_patch 转为结构化 proxy functions", () => {
+  const { chatRequest, toolContext } = toChatCompletionsRequest({
+    model: "glm-5",
+    input: "改 README",
+    tools: [
+      {
+        type: "custom",
+        name: "apply_patch",
+        description: "Apply patch",
+        format: { type: "grammar", definition: "begin_patch end_patch add_hunk" }
+      }
+    ]
+  }, { injectCodexBehavior: false });
+
+  const names = chatRequest.tools.map((tool) => tool.function.name);
+  assert.deepEqual(names, [
+    "apply_patch_add_file",
+    "apply_patch_delete_file",
+    "apply_patch_update_file",
+    "apply_patch_replace_file",
+    "apply_patch_batch"
+  ]);
+  assert.equal(toolContext.customTools.get("apply_patch_batch").kind, "apply_patch");
+});
+
+test("apply_patch proxy tool_call 回映射为 custom_tool_call", () => {
+  const toolContext = buildCodexToolContext([
+    { type: "custom", name: "apply_patch", format: { definition: "begin_patch end_patch" } }
+  ]);
+
+  const response = fromChatCompletionsResponse({
+    id: "chatcmpl_patch_proxy",
+    created: 123,
+    model: "glm-5",
+    choices: [
+      {
+        finish_reason: "tool_calls",
+        message: {
+          role: "assistant",
+          tool_calls: [
+            {
+              id: "call_patch",
+              type: "function",
+              function: {
+                name: "apply_patch_update_file",
+                arguments: JSON.stringify({
+                  path: "README.md",
+                  hunks: [{ lines: [{ op: "remove", text: "旧" }, { op: "add", text: "新" }] }]
+                })
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }, { responseId: "resp_patch_proxy", toolContext });
+
+  assert.equal(response.output[0].type, "custom_tool_call");
+  assert.equal(response.output[0].name, "apply_patch");
+  assert.equal(response.output[0].input, [
+    "*** Begin Patch",
+    "*** Update File: README.md",
+    "@@",
+    "-旧",
+    "+新",
+    "*** End Patch"
+  ].join("\n"));
+});
+
+test("namespace 工具扁平化给上游，返回时还原 namespace", () => {
+  const request = {
+    model: "glm-5",
+    input: "列文件",
+    tools: [
+      {
+        type: "namespace",
+        name: "mcp__server__",
+        tools: [
+          {
+            type: "function",
+            name: "list_files",
+            description: "列文件",
+            parameters: { type: "object", properties: {} }
+          }
+        ]
+      }
+    ]
+  };
+
+  const { chatRequest, toolContext } = toChatCompletionsRequest(request, { injectCodexBehavior: false });
+  assert.equal(chatRequest.tools[0].function.name, "mcp__server__list_files");
+
+  const response = fromChatCompletionsResponse({
+    id: "chatcmpl_ns",
+    created: 123,
+    model: "glm-5",
+    choices: [
+      {
+        finish_reason: "tool_calls",
+        message: {
+          role: "assistant",
+          tool_calls: [
+            {
+              id: "call_ns",
+              type: "function",
+              function: { name: "mcp__server__list_files", arguments: "{}" }
+            }
+          ]
+        }
+      }
+    ]
+  }, { responseId: "resp_ns", toolContext });
+
+  assert.equal(response.output[0].type, "function_call");
+  assert.equal(response.output[0].name, "list_files");
+  assert.equal(response.output[0].namespace, "mcp__server__");
 });
 
 test("支持 previous_response_id/conversation 有状态引用", () => {

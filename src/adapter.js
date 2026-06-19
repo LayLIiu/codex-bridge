@@ -4,11 +4,23 @@ import { estimateTokens } from './token-estimator.js';
 const CHAT_ROLES = new Set(["system", "developer", "user", "assistant"]);
 const NATIVE_TOOL_TYPES = new Set([
   "web_search",
+  "local_shell",
+  "computer_use",
+  "tool_search",
   "web_search_preview",
   "image_generation",
   "code_interpreter",
   "computer_use_preview",
   "file_search"
+]);
+
+const GENERIC_CODEX_TOOL_TYPES = new Set([
+  "web_search",
+  "local_shell",
+  "computer_use",
+  "tool_search",
+  "web_search_preview",
+  "computer_use_preview"
 ]);
 
 const CODEX_BRIDGE_BEHAVIOR_PROMPT = [
@@ -61,7 +73,8 @@ export function toChatCompletionsRequest(responsesRequest, options = {}) {
   
   // 不再使用 conversationManager 存储历史
   // Codex Desktop 会自己管理对话历史，每次发送完整的 input
-  messages = normalizeInputToMessages(responsesRequest.input ?? []);
+  const toolContext = buildCodexToolContext(responsesRequest.tools ?? []);
+  messages = normalizeInputToMessages(responsesRequest.input ?? [], { toolContext });
   
   // conversationId 用于 session 关联，不用于对话历史存储
   conversationId = responsesRequest.previous_response_id || responsesRequest.conversation || null;
@@ -69,7 +82,8 @@ export function toChatCompletionsRequest(responsesRequest, options = {}) {
   const tools = mapTools(responsesRequest.tools ?? [], {
     onUnsupportedNativeTool: options.onUnsupportedNativeTool ?? "warn",
     warnings,
-    simulateNativeTools: options.simulateNativeTools ?? false
+    simulateNativeTools: options.simulateNativeTools ?? false,
+    toolContext
   });
 
   messages = prependInstructions(messages, buildInstructions(responsesRequest.instructions, {
@@ -91,7 +105,7 @@ export function toChatCompletionsRequest(responsesRequest, options = {}) {
 
   if (tools.length > 0) {
     chatRequest.tools = tools;
-    chatRequest.tool_choice = mapToolChoice(responsesRequest.tool_choice);
+    chatRequest.tool_choice = mapToolChoice(responsesRequest.tool_choice, toolContext);
   }
 
   copyKnownGenerationOptions(responsesRequest, chatRequest);
@@ -99,7 +113,8 @@ export function toChatCompletionsRequest(responsesRequest, options = {}) {
   return { 
     chatRequest, 
     warnings, 
-    conversationId
+    conversationId,
+    toolContext
   };
 }
 
@@ -133,19 +148,19 @@ export function fromChatCompletionsResponse(chatResponse, options = {}) {
       const toolCall = message.tool_calls[index];
       if (toolCall.type !== "function") continue;
       const callId = toolCall.id || `call_${responseId}_${index}`;
-      output.push({
+      output.push(remapToolCallItem({
         type: "function_call",
         id: callId,
         call_id: callId,
         name: toolCall.function?.name,
         arguments: toolCall.function?.arguments ?? "{}",
         status: "completed"
-      });
+      }, options.toolContext));
     }
   }
 
   if (repairedToolCall) {
-    output.push(repairedToolCall);
+    output.push(remapToolCallItem(repairedToolCall, options.toolContext));
   }
 
   return {
@@ -194,6 +209,7 @@ export function createStreamConverter(responseId, model, options = {}) {
   const textFilter = createReasoningFilter({ enabled: !enableReasoning });
 
   // 按 tool call index 跟踪累积状态
+  const toolContext = options.toolContext ?? createEmptyToolContext();
   const toolCallStates = new Map(); // index → { id, name, args }
 
   function flush(events) {
@@ -301,29 +317,42 @@ export function createStreamConverter(responseId, model, options = {}) {
           // 第一个分片到达时发出 output_item.added
           if (!state.emitted) {
             const itemOutputIndex = outputIndex + (textItemActive ? 1 : 0) + idx;
+            const addedItem = remapToolCallItem({
+              type: "function_call",
+              id: state.id,
+              call_id: state.id,
+              name: state.name,
+              arguments: "",
+              status: "in_progress"
+            }, toolContext);
             events.push(seq({
               type: "response.output_item.added",
               output_index: itemOutputIndex,
-              item: {
-                type: "function_call",
-                id: state.id,
-                call_id: state.id,
-                name: state.name,
-                arguments: "",
-                status: "in_progress"
-              }
+              item: addedItem
             }));
             state.emitted = true;
             state.itemOutputIndex = itemOutputIndex;
           }
 
           if (tc.function?.arguments) {
+            const partialItem = remapToolCallItem({
+              type: "function_call",
+              id: state.id,
+              call_id: state.id,
+              name: state.name,
+              arguments: state.args,
+              status: "in_progress"
+            }, toolContext);
             events.push(seq({
-              type: "response.function_call_arguments.delta",
+              type: partialItem.type === "custom_tool_call"
+                ? "response.custom_tool_call_input.delta"
+                : "response.function_call_arguments.delta",
               output_index: state.itemOutputIndex,
               item_id: state.id,
               call_id: state.id,
-              delta: tc.function.arguments
+              delta: partialItem.type === "custom_tool_call"
+                ? reconstructCustomToolInput(toolContext.customTools.get(state.name), state.name, tc.function.arguments)
+                : tc.function.arguments
             }));
           }
         }
@@ -359,24 +388,27 @@ export function createStreamConverter(responseId, model, options = {}) {
 
         for (const [idx, state] of toolCallStates) {
           if (!state.emitted) continue;
+          const doneItem = remapToolCallItem({
+            type: "function_call",
+            id: state.id,
+            call_id: state.id,
+            name: state.name,
+            arguments: state.args,
+            status: "completed"
+          }, toolContext);
           events.push(seq({
-            type: "response.function_call_arguments.done",
+            type: doneItem.type === "custom_tool_call"
+              ? "response.custom_tool_call_input.done"
+              : "response.function_call_arguments.done",
             output_index: state.itemOutputIndex,
             item_id: state.id,
             call_id: state.id,
-            arguments: state.args
+            arguments: doneItem.arguments ?? doneItem.input ?? state.args
           }));
           events.push(seq({
             type: "response.output_item.done",
             output_index: state.itemOutputIndex,
-            item: {
-              type: "function_call",
-              id: state.id,
-              call_id: state.id,
-              name: state.name,
-              arguments: state.args,
-              status: "completed"
-            }
+            item: doneItem
           }));
         }
 
@@ -391,14 +423,14 @@ export function createStreamConverter(responseId, model, options = {}) {
           });
         }
         for (const [idx, state] of toolCallStates) {
-          outputItems.push({
+          outputItems.push(remapToolCallItem({
             type: "function_call",
             id: state.id,
             call_id: state.id,
             name: state.name,
             arguments: state.args,
             status: "completed"
-          });
+          }, toolContext));
         }
 
         events.push(seq({
@@ -420,7 +452,8 @@ export function createStreamConverter(responseId, model, options = {}) {
   };
 }
 
-export function normalizeInputToMessages(input) {
+export function normalizeInputToMessages(input, options = {}) {
+  const toolContext = options.toolContext ?? createEmptyToolContext();
   const items = Array.isArray(input) ? input : [input];
   let messages = [];
 
@@ -451,6 +484,25 @@ export function normalizeInputToMessages(input) {
             function: {
               name: item.name,
               arguments: stringifyArguments(item.arguments)
+            }
+          }
+        ]
+      });
+      continue;
+    }
+
+    if (item.type === "custom_tool_call") {
+      const { name, arguments: args } = buildCustomToolHistoryArguments(item.name, item.input ?? item.arguments ?? "", toolContext);
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: item.call_id ?? item.id,
+            type: "function",
+            function: {
+              name,
+              arguments: args
             }
           }
         ]
@@ -619,22 +671,530 @@ function compressMessages(messages, maxTokens = 120000) {
   return [...systemMessages, ...keptMessages];
 }
 
-export function mapTools(responseTools, { onUnsupportedNativeTool = "warn", warnings = [], simulateNativeTools = false } = {}) {
+function createEmptyToolContext() {
+  return {
+    customTools: new Map(),
+    functionTools: new Map(),
+    hasCustomTools: false,
+    hasNamespaceTools: false
+  };
+}
+
+export function buildCodexToolContext(responseTools = []) {
+  const context = createEmptyToolContext();
+
+  for (const rawTool of responseTools) {
+    if (typeof rawTool === "string" && rawTool.length > 0) {
+      context.customTools.set(rawTool, { originalName: rawTool, kind: "raw" });
+      context.hasCustomTools = true;
+      continue;
+    }
+
+    if (!rawTool || typeof rawTool !== "object") continue;
+
+    if (rawTool.type === "custom") {
+      const name = rawTool.name;
+      if (!name) continue;
+      const kind = detectCustomToolKind(rawTool);
+      context.customTools.set(name, { originalName: name, kind });
+      if (kind === "apply_patch") {
+        for (const action of ["add_file", "delete_file", "update_file", "replace_file", "batch"]) {
+          context.customTools.set(`${name}_${action}`, { originalName: name, kind, action });
+        }
+      }
+      context.hasCustomTools = true;
+      continue;
+    }
+
+    if (rawTool.type === "function") {
+      const name = rawTool.name ?? rawTool.function?.name;
+      if (name) context.functionTools.set(name, { name, namespace: "" });
+      continue;
+    }
+
+    if (rawTool.type === "namespace") {
+      addNamespaceToolsToContext(context, rawTool);
+      continue;
+    }
+
+    if (GENERIC_CODEX_TOOL_TYPES.has(rawTool.type)) {
+      const name = rawTool.name || rawTool.type;
+      context.customTools.set(name, { originalName: name, kind: "builtin" });
+      context.hasCustomTools = true;
+    }
+  }
+
+  return context;
+}
+
+function detectCustomToolKind(tool) {
+  if (tool.name === "apply_patch") return "apply_patch";
+  const grammar = tool.format?.definition ?? tool.grammar?.definition ?? "";
+  if (
+    typeof grammar === "string" &&
+    grammar.includes("begin_patch") &&
+    grammar.includes("end_patch")
+  ) {
+    return "apply_patch";
+  }
+  if (tool.name === "exec") return "exec";
+  return "raw";
+}
+
+function addNamespaceToolsToContext(context, namespaceTool) {
+  const namespace = namespaceTool.name ?? "";
+  const children = Array.isArray(namespaceTool.tools) ? namespaceTool.tools : [];
+  for (const child of children) {
+    if (!child || typeof child !== "object" || child.type !== "function") continue;
+    const name = child.name ?? child.function?.name;
+    if (!name) continue;
+    const flatName = flattenNamespaceToolName(namespace, name);
+    if (context.functionTools.has(flatName) && !context.functionTools.get(flatName)?.namespace) continue;
+    context.functionTools.set(flatName, { namespace, name });
+    context.hasNamespaceTools = true;
+  }
+}
+
+function flattenNamespaceToolName(namespace, name) {
+  if (!namespace) return name;
+  if (!name) return namespace;
+  if (namespace.endsWith("__") || name.startsWith("__")) return `${namespace}${name}`;
+  return `${namespace}__${name}`;
+}
+
+function makeNamespaceProxyTools(namespaceTool, context) {
+  const namespace = namespaceTool.name ?? "";
+  const namespaceDescription = namespaceTool.description ?? "";
+  const children = Array.isArray(namespaceTool.tools) ? namespaceTool.tools : [];
   const tools = [];
 
+  for (const child of children) {
+    if (!child || typeof child !== "object" || child.type !== "function") continue;
+    const name = child.name ?? child.function?.name;
+    if (!name) continue;
+    const flatName = flattenNamespaceToolName(namespace, name);
+    const spec = context.functionTools.get(flatName);
+    if (namespace && spec && spec.namespace === "") continue;
+    const childDescription = child.description ?? child.function?.description ?? "";
+    tools.push({
+      type: "function",
+      function: {
+        name: flatName,
+        description: combineDescriptions(namespaceDescription, childDescription),
+        parameters: child.parameters ?? child.function?.parameters ?? { type: "object", properties: {} },
+        ...((child.strict ?? child.function?.strict) === undefined ? {} : { strict: child.strict ?? child.function?.strict })
+      }
+    });
+  }
+
+  return tools;
+}
+
+function combineDescriptions(first, second) {
+  const a = typeof first === "string" ? first.trim() : "";
+  const b = typeof second === "string" ? second.trim() : "";
+  if (!a) return b || undefined;
+  if (!b) return a;
+  return `${a}\n\n${b}`;
+}
+
+function makeGenericCustomProxyTool(name, description) {
+  const desc = description
+    ? `${description}\n\n这是 Codex freeform/custom 工具代理。把原始工具输入放在 input 字段，不要再包 markdown。`
+    : `Codex freeform/custom 工具代理：${name}。把原始工具输入放在 input 字段。`;
+  return {
+    type: "function",
+    function: {
+      name,
+      description: desc,
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          input: { type: "string", description: "原始工具输入文本。" }
+        },
+        required: ["input"]
+      }
+    }
+  };
+}
+
+function makeApplyPatchProxyTools(name, description) {
+  return [
+    makeFunctionTool(`${name}_add_file`, patchProxyDescription(description, "add_file", "新增一个文件，提供路径和完整内容。"), {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        path: { type: "string", description: "目标文件路径。" },
+        content: { type: "string", description: "完整文件内容，不要包含 patch 的 + 前缀。" }
+      },
+      required: ["path", "content"]
+    }),
+    makeFunctionTool(`${name}_delete_file`, patchProxyDescription(description, "delete_file", "删除一个文件，提供路径。"), {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        path: { type: "string", description: "目标文件路径。" }
+      },
+      required: ["path"]
+    }),
+    makeFunctionTool(`${name}_update_file`, patchProxyDescription(description, "update_file", "修改一个已有文件，提供结构化 hunks。"), {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        path: { type: "string", description: "目标文件路径。" },
+        move_to: { type: "string", description: "可选，移动到的新路径。" },
+        hunks: applyPatchHunksSchema()
+      },
+      required: ["path", "hunks"]
+    }),
+    makeFunctionTool(`${name}_replace_file`, patchProxyDescription(description, "replace_file", "替换一个已有文件，提供路径和完整新内容。"), {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        path: { type: "string", description: "目标文件路径。" },
+        content: { type: "string", description: "完整替换内容。" }
+      },
+      required: ["path", "content"]
+    }),
+    makeFunctionTool(`${name}_batch`, patchProxyDescription(description, "batch", "一次提交多个文件编辑操作。"), {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        operations: {
+          type: "array",
+          description: "按顺序执行的文件编辑操作。",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              type: { type: "string", enum: ["add_file", "delete_file", "update_file", "replace_file"] },
+              path: { type: "string" },
+              move_to: { type: "string" },
+              content: { type: "string" },
+              hunks: applyPatchHunksSchema()
+            },
+            required: ["type", "path"]
+          }
+        }
+      },
+      required: ["operations"]
+    })
+  ];
+}
+
+function makeFunctionTool(name, description, parameters) {
+  return { type: "function", function: { name, description, parameters } };
+}
+
+function patchProxyDescription(description, action, fallback) {
+  return description ? `${description}（proxy action: ${action}）` : fallback;
+}
+
+function applyPatchHunksSchema() {
+  return {
+    type: "array",
+    description: "结构化 patch hunk。context 可选，lines 内 op 为 context/add/remove。",
+    items: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        context: { type: "string" },
+        lines: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              op: { type: "string", enum: ["context", "add", "remove"] },
+              text: { type: "string" }
+            },
+            required: ["op", "text"]
+          }
+        }
+      },
+      required: ["lines"]
+    }
+  };
+}
+
+function remapToolCallItem(item, toolContext = createEmptyToolContext()) {
+  if (!item || item.type !== "function_call") return item;
+
+  const namespaceSpec = toolContext.functionTools.get(item.name);
+  if (namespaceSpec?.namespace) {
+    return {
+      ...item,
+      name: namespaceSpec.name,
+      namespace: namespaceSpec.namespace
+    };
+  }
+
+  const customSpec = toolContext.customTools.get(item.name);
+  if (!customSpec) return item;
+
+  const input = reconstructCustomToolInput(customSpec, item.name, item.arguments ?? "{}");
+  return {
+    type: "custom_tool_call",
+    id: item.id,
+    call_id: item.call_id,
+    name: customSpec.originalName,
+    input,
+    status: item.status ?? "completed"
+  };
+}
+
+function reconstructCustomToolInput(spec, upstreamName, rawArguments) {
+  if (spec.kind === "apply_patch") {
+    return applyPatchInputFromProxyArguments(rawArguments, spec.action ?? proxyActionFromName(upstreamName));
+  }
+
+  const parsed = parseJsonObject(rawArguments);
+  if (typeof parsed?.input === "string") return parsed.input;
+  return typeof rawArguments === "string" ? rawArguments : JSON.stringify(rawArguments ?? {});
+}
+
+function applyPatchInputFromProxyArguments(rawArguments, action) {
+  const args = parseJsonObject(rawArguments);
+  if (!args) return typeof rawArguments === "string" ? normalizePatchText(rawArguments) : "";
+
+  if (typeof args.input === "string" && action) {
+    const nested = parseJsonObject(args.input);
+    if (nested) Object.assign(args, { ...nested, ...args });
+  }
+
+  const operations = [];
+  if (action === "add_file") {
+    operations.push({ type: "add_file", path: args.path, content: args.content });
+  } else if (action === "delete_file") {
+    operations.push({ type: "delete_file", path: args.path });
+  } else if (action === "update_file") {
+    operations.push({ type: "update_file", path: args.path, move_to: args.move_to, hunks: args.hunks });
+  } else if (action === "replace_file") {
+    operations.push({ type: "replace_file", path: args.path, content: args.content });
+  } else if (action === "batch" && Array.isArray(args.operations)) {
+    operations.push(...args.operations);
+  } else if (typeof args.input === "string") {
+    return normalizePatchText(args.input);
+  } else if (typeof args.patch === "string") {
+    return normalizePatchText(args.patch);
+  } else if (typeof args.raw_patch === "string") {
+    return normalizePatchText(args.raw_patch);
+  }
+
+  return buildApplyPatchInput(operations.length > 0 ? operations : [{ type: "batch" }]);
+}
+
+function buildApplyPatchInput(operations) {
+  const lines = ["*** Begin Patch"];
+  for (const operation of operations) {
+    if (!operation || typeof operation !== "object") continue;
+    const type = operation.type;
+    if (type === "add_file") {
+      lines.push(`*** Add File: ${operation.path ?? ""}`);
+      for (const line of splitPatchContent(operation.content ?? "")) lines.push(`+${line}`);
+    } else if (type === "delete_file") {
+      lines.push(`*** Delete File: ${operation.path ?? ""}`);
+    } else if (type === "update_file") {
+      lines.push(`*** Update File: ${operation.path ?? ""}`);
+      if (operation.move_to) lines.push(`*** Move to: ${operation.move_to}`);
+      const hunks = Array.isArray(operation.hunks) ? operation.hunks : [];
+      for (const hunk of hunks) {
+        lines.push(hunk?.context ? `@@ ${hunk.context}` : "@@");
+        const hunkLines = Array.isArray(hunk?.lines) ? hunk.lines : [];
+        for (const line of hunkLines) {
+          lines.push(`${patchLinePrefix(line?.op)}${line?.text ?? ""}`);
+        }
+      }
+    } else if (type === "replace_file") {
+      lines.push(`*** Delete File: ${operation.path ?? ""}`);
+      lines.push(`*** Add File: ${operation.path ?? ""}`);
+      for (const line of splitPatchContent(operation.content ?? "")) lines.push(`+${line}`);
+    }
+  }
+  lines.push("*** End Patch");
+  return lines.join("\n");
+}
+
+function splitPatchContent(content) {
+  return String(content ?? "").replace(/\n$/, "").split("\n");
+}
+
+function patchLinePrefix(op) {
+  if (op === "add") return "+";
+  if (op === "remove" || op === "delete") return "-";
+  return " ";
+}
+
+function proxyActionFromName(name) {
+  for (const action of ["add_file", "delete_file", "update_file", "replace_file", "batch"]) {
+    if (name?.endsWith(`_${action}`)) return action;
+  }
+  return "";
+}
+
+function buildCustomToolHistoryArguments(originalName, input, toolContext) {
+  const spec = toolContext.customTools.get(originalName);
+  if (spec?.kind === "apply_patch" || originalName === "apply_patch" || String(input).includes("*** Begin Patch")) {
+    const operations = parseApplyPatchOperations(String(input ?? ""));
+    if (operations.length === 1) {
+      const action = operations[0].type;
+      return { name: `${originalName}_${action}`, arguments: JSON.stringify(singlePatchOperationArguments(operations[0])) };
+    }
+    return { name: `${originalName}_batch`, arguments: JSON.stringify({ operations }) };
+  }
+  return { name: spec?.originalName ?? originalName, arguments: JSON.stringify({ input: String(input ?? "") }) };
+}
+
+function parseApplyPatchOperations(input) {
+  if (typeof input !== "string" || !input.includes("*** Begin Patch")) return [];
+  const lines = input.split("\n");
+  const operations = [];
+  let current = null;
+  let currentHunk = null;
+
+  const pushCurrent = () => {
+    if (current) operations.push(current);
+    current = null;
+    currentHunk = null;
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, "");
+    if (line === "*** Begin Patch" || line === "*** End Patch") continue;
+    if (line.startsWith("*** Add File: ")) {
+      pushCurrent();
+      current = { type: "add_file", path: line.slice(14), content: "" };
+      continue;
+    }
+    if (line.startsWith("*** Delete File: ")) {
+      pushCurrent();
+      current = { type: "delete_file", path: line.slice(17) };
+      continue;
+    }
+    if (line.startsWith("*** Update File: ")) {
+      pushCurrent();
+      current = { type: "update_file", path: line.slice(17), hunks: [] };
+      continue;
+    }
+    if (line.startsWith("*** Move to: ") && current?.type === "update_file") {
+      current.move_to = line.slice(13);
+      continue;
+    }
+    if (line.startsWith("@@") && current?.type === "update_file") {
+      currentHunk = { context: line.slice(2).trim(), lines: [] };
+      current.hunks.push(currentHunk);
+      continue;
+    }
+    if (!current) continue;
+    if (current.type === "add_file" && line.startsWith("+")) {
+      current.content += `${line.slice(1)}\n`;
+    } else if (current.type === "update_file" && currentHunk) {
+      const prefix = line[0];
+      if (prefix === "+" || prefix === "-" || prefix === " ") {
+        currentHunk.lines.push({
+          op: prefix === "+" ? "add" : prefix === "-" ? "remove" : "context",
+          text: line.slice(1)
+        });
+      }
+    }
+  }
+
+  pushCurrent();
+  return operations;
+}
+
+function singlePatchOperationArguments(operation) {
+  if (operation.type === "add_file" || operation.type === "replace_file") {
+    return { path: operation.path, content: operation.content ?? "" };
+  }
+  if (operation.type === "delete_file") return { path: operation.path };
+  if (operation.type === "update_file") {
+    return {
+      path: operation.path,
+      ...(operation.move_to ? { move_to: operation.move_to } : {}),
+      hunks: operation.hunks ?? []
+    };
+  }
+  return operation;
+}
+
+function parseJsonObject(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function mapTools(responseTools, {
+  onUnsupportedNativeTool = "warn",
+  warnings = [],
+  simulateNativeTools = false,
+  toolContext = buildCodexToolContext(responseTools)
+} = {}) {
+  const tools = [];
+  const seenNames = new Set();
+
+  const pushTool = (tool) => {
+    const name = tool?.function?.name;
+    if (typeof name === "string" && name.length > 0) {
+      if (seenNames.has(name)) return;
+      seenNames.add(name);
+    }
+    tools.push(tool);
+  };
+
   for (const tool of responseTools) {
+    if (typeof tool === "string" && tool.length > 0) {
+      pushTool(makeGenericCustomProxyTool(tool, ""));
+      continue;
+    }
+
     if (!tool || typeof tool !== "object") continue;
 
     if (tool.type === "function") {
-      tools.push({
+      const name = tool.name ?? tool.function?.name;
+      pushTool({
         type: "function",
         function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.parameters ?? { type: "object", properties: {} },
-          ...(tool.strict === undefined ? {} : { strict: tool.strict })
+          name,
+          description: tool.description ?? tool.function?.description,
+          parameters: tool.parameters ?? tool.function?.parameters ?? { type: "object", properties: {} },
+          ...((tool.strict ?? tool.function?.strict) === undefined ? {} : { strict: tool.strict ?? tool.function?.strict })
         }
       });
+      continue;
+    }
+
+    if (tool.type === "custom") {
+      const name = tool.name;
+      if (!name) continue;
+      const spec = toolContext.customTools.get(name);
+      if (spec?.kind === "apply_patch") {
+        for (const proxy of makeApplyPatchProxyTools(name, tool.description ?? "")) {
+          pushTool(proxy);
+        }
+      } else {
+        pushTool(makeGenericCustomProxyTool(name, tool.description ?? ""));
+      }
+      continue;
+    }
+
+    if (tool.type === "namespace") {
+      for (const namespaceTool of makeNamespaceProxyTools(tool, toolContext)) {
+        pushTool(namespaceTool);
+      }
+      continue;
+    }
+
+    if (GENERIC_CODEX_TOOL_TYPES.has(tool.type)) {
+      const name = tool.name || tool.type;
+      pushTool(makeGenericCustomProxyTool(name, tool.description ?? ""));
+      warnings.push(`已将 Codex 原生工具 ${tool.type} 转换为 function proxy：${name}。`);
       continue;
     }
 
@@ -643,7 +1203,7 @@ export function mapTools(responseTools, { onUnsupportedNativeTool = "warn", warn
         // 将原生工具转换为 function tool
         const simulatedTool = simulateNativeTool(tool);
         if (simulatedTool) {
-          tools.push(simulatedTool);
+          pushTool(simulatedTool);
           warnings.push(`已将原生工具 ${tool.type} 转换为 function tool 进行模拟。`);
           continue;
         }
@@ -662,14 +1222,31 @@ export function mapTools(responseTools, { onUnsupportedNativeTool = "warn", warn
   return tools;
 }
 
-function mapToolChoice(toolChoice) {
+function mapToolChoice(toolChoice, toolContext = createEmptyToolContext()) {
   if (!toolChoice || toolChoice === "auto") return "auto";
   if (toolChoice === "none") return "none";
   if (toolChoice === "required") return "required";
   if (typeof toolChoice === "object" && toolChoice.type === "function") {
+    const namespace = toolChoice.namespace ?? toolChoice.function?.namespace;
+    const name = toolChoice.name ?? toolChoice.function?.name;
+    if (namespace && name) {
+      return {
+        type: "function",
+        function: { name: flattenNamespaceToolName(namespace, name) }
+      };
+    }
     return {
       type: "function",
-      function: { name: toolChoice.name ?? toolChoice.function?.name }
+      function: { name }
+    };
+  }
+  if (typeof toolChoice === "object" && toolChoice.type === "custom") {
+    const name = toolChoice.name;
+    const spec = toolContext.customTools.get(name);
+    if (!spec) return "auto";
+    return {
+      type: "function",
+      function: { name: spec.kind === "apply_patch" ? `${name}_batch` : name }
     };
   }
   return "auto";
