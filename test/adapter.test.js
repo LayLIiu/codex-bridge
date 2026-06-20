@@ -10,7 +10,9 @@ import {
   toChatCompletionsRequest,
   UnsupportedNativeToolError,
   validateToolCalls,
-  buildRetryMessages
+  buildRetryMessages,
+  buildCustomToolCallHistoryArguments,
+  replayCustomToolCall
 } from "../src/adapter.js";
 import {
   resolveChatCompletionsUrl } from "../src/server.js";
@@ -510,6 +512,10 @@ test("createStreamConverter 把 Chat delta 转为 Responses SSE 事件", () => {
   assert.ok(types.includes("response.output_item.added"));
   assert.ok(types.includes("response.content_part.added"));
   assert.ok(types.includes("response.output_text.delta"));
+  assert.equal(events[0].response.background, false);
+  assert.equal(events[0].response.service_tier, "auto");
+  assert.match(events.find((e) => e.type === "response.output_item.added").item.id, /^msg_/);
+  assert.equal(events.find((e) => e.type === "response.output_text.delta").item_id.startsWith("msg_"), true);
 
   // 第二个 chunk：继续文本
   events = converter.processChunk({
@@ -570,6 +576,8 @@ test("createStreamConverter 处理流式 tool_calls", () => {
   assert.ok(addedEvents.length > 0);
   assert.equal(addedEvents[0].item.type, "function_call");
   assert.equal(addedEvents[0].item.name, "shell");
+  assert.match(addedEvents[0].item.id, /^fc_/);
+  assert.equal(addedEvents[0].item.call_id, "call_x1");
 
   // 参数分片
   events = converter.processChunk({
@@ -588,6 +596,8 @@ test("createStreamConverter 处理流式 tool_calls", () => {
   const argEvents = events.filter((e) => e.type === "response.function_call_arguments.delta");
   assert.ok(argEvents.length > 0);
   assert.equal(argEvents[0].call_id, "call_x1");
+  assert.match(argEvents[0].item_id, /^fc_/);
+  assert.equal(typeof argEvents[0].obfuscation, "string");
   assert.equal(argEvents[0].delta, '{"cmd":"ls"}');
 
   // 结束
@@ -620,6 +630,51 @@ test("createStreamConverter 为缺失 id 的流式 tool_call 兜底", () => {
 
   const added = events.find((e) => e.type === "response.output_item.added" && e.item?.type === "function_call");
   assert.equal(added.item.call_id, "call_resp_tool_missing_0");
+  assert.match(added.item.id, /^fc_/);
+});
+
+test("createStreamConverter 对 custom apply_patch 输出官方 custom_tool_call 事件", () => {
+  const toolContext = buildCodexToolContext([
+    { type: "custom", name: "apply_patch", format: { definition: "begin_patch end_patch" } }
+  ]);
+  const converter = createStreamConverter("resp_custom", "glm-5", { toolContext });
+
+  let events = converter.processChunk({
+    choices: [{
+      delta: {
+        tool_calls: [{
+          index: 0,
+          id: "call_patch",
+          type: "function",
+          function: {
+            name: "apply_patch_update_file",
+            arguments: JSON.stringify({
+              path: "README.md",
+              hunks: [{ lines: [{ op: "remove", text: "旧" }, { op: "add", text: "新" }] }]
+            })
+          }
+        }]
+      }
+    }]
+  });
+
+  const added = events.find((event) => event.type === "response.output_item.added");
+  assert.equal(added.item.type, "custom_tool_call");
+  assert.match(added.item.id, /^ctc_/);
+  assert.equal(added.item.call_id, "call_patch");
+
+  events = converter.processChunk({
+    choices: [{ delta: {}, finish_reason: "tool_calls" }]
+  });
+  const delta = events.find((event) => event.type === "response.custom_tool_call_input.delta");
+  const done = events.find((event) => event.type === "response.custom_tool_call_input.done");
+  assert.match(delta.item_id, /^ctc_/);
+  // delta 拆成 12 字符小段，拼接后应该包含完整 patch
+  const allDeltas = events.filter((event) => event.type === "response.custom_tool_call_input.delta");
+  assert.ok(allDeltas.length > 1, `应该拆成多个 delta，实际 ${allDeltas.length}`);
+  const joined = allDeltas.map((e) => e.delta).join("");
+  assert.match(joined, /\*\*\* Begin Patch/);
+  assert.match(done.input, /\*\*\* Update File: README\.md/);
 });
 
 // ── 工具调用验证与重试测试 ──
@@ -821,4 +876,159 @@ test("纯文本无工具调用时不清洗", () => {
   const messages = response.output.filter(o => o.type === "message");
   assert.equal(messages.length, 1);
   assert.match(messages[0].content[0].text, /好的/);
+});
+
+test("buildCustomToolCallHistoryArguments 把 apply_patch 历史转成上游 proxy", () => {
+  const ctx = buildCodexToolContext([
+    { type: "custom", name: "apply_patch", format: { definition: "*** Begin Patch\n*** End Patch" } }
+  ]);
+
+  // 单操作 → add_file proxy
+  const patch1 = "*** Begin Patch\n*** Add File: src/foo.js\n+console.log('hello');\n*** End Patch";
+  const r1 = buildCustomToolCallHistoryArguments(ctx, "apply_patch", patch1);
+  assert.equal(r1.name, "apply_patch_add_file");
+  const args1 = JSON.parse(r1.arguments);
+  assert.equal(args1.path, "src/foo.js");
+  assert.ok(args1.content.includes("console.log"));
+
+  // 多操作 → batch proxy
+  const patch2 = [
+    "*** Begin Patch",
+    "*** Add File: a.js\n+aaa",
+    "*** Delete File: b.js",
+    "*** End Patch"
+  ].join("\n");
+  const r2 = buildCustomToolCallHistoryArguments(ctx, "apply_patch", patch2);
+  assert.equal(r2.name, "apply_patch_batch");
+  const args2 = JSON.parse(r2.arguments);
+  assert.ok(Array.isArray(args2.operations));
+  assert.equal(args2.operations.length, 2);
+});
+
+test("replayCustomToolCall 简化版回放不依赖 toolContext", () => {
+  const patch = "*** Begin Patch\n*** Delete File: old.js\n*** End Patch";
+  const r = replayCustomToolCall("apply_patch", patch);
+  assert.equal(r.name, "apply_patch_delete_file");
+  const args = JSON.parse(r.arguments);
+  assert.equal(args.path, "old.js");
+
+  // 非 apply_patch 工具 → 直接包装 input
+  const r2 = replayCustomToolCall("web_search", "query text");
+  assert.equal(r2.name, "web_search");
+  const args2 = JSON.parse(r2.arguments);
+  assert.equal(args2.input, "query text");
+});
+
+test("stream 请求自动加 stream_options.include_usage", () => {
+  const { chatRequest } = toChatCompletionsRequest({
+    model: "glm-5",
+    input: [{ type: "message", role: "user", content: "hi" }],
+    stream: true
+  });
+  assert.deepEqual(chatRequest.stream_options, { include_usage: true });
+});
+
+test("非 stream 请求不加 stream_options", () => {
+  const { chatRequest } = toChatCompletionsRequest({
+    model: "glm-5",
+    input: [{ type: "message", role: "user", content: "hi" }]
+  });
+  assert.equal(chatRequest.stream_options, undefined);
+});
+
+test("tool parameters 自动补齐 required/type/properties", () => {
+  const { chatRequest } = toChatCompletionsRequest({
+    model: "glm-5",
+    input: [{ type: "message", role: "user", content: "hi" }],
+    tools: [{
+      type: "function",
+      name: "test_tool",
+      description: "desc",
+      parameters: { description: "missing all fields" }
+    }]
+  });
+  const params = chatRequest.tools[0].function.parameters;
+  assert.equal(params.type, "object");
+  assert.deepEqual(params.properties, {});
+  assert.deepEqual(params.required, []);
+  assert.equal(params.description, "missing all fields");
+});
+
+test("reasoning.effort 映射到上游格式", () => {
+  const { chatRequest: r1 } = toChatCompletionsRequest({
+    model: "glm-5",
+    input: [{ type: "message", role: "user", content: "hi" }],
+    reasoning: { effort: "medium" }
+  });
+  assert.equal(r1.reasoning_effort, "medium");
+
+  const { chatRequest: r2 } = toChatCompletionsRequest({
+    model: "glm-5",
+    input: [{ type: "message", role: "user", content: "hi" }],
+    reasoning: { effort: "none" }
+  });
+  assert.equal(r2.reasoning_effort, "none");
+
+  const { chatRequest: r3 } = toChatCompletionsRequest({
+    model: "glm-5",
+    input: [{ type: "message", role: "user", content: "hi" }],
+    reasoning: { effort: "xhigh" }
+  });
+  assert.equal(r3.reasoning_effort, "high");
+});
+
+test("local_shell proxy tool_call 回映射为 custom_tool_call", () => {
+  const toolContext = buildCodexToolContext([
+    { type: "local_shell" }
+  ]);
+
+  const response = fromChatCompletionsResponse({
+    id: "chatcmpl_shell",
+    created: 123,
+    model: "glm-5",
+    choices: [{
+      finish_reason: "tool_calls",
+      message: {
+        role: "assistant",
+        tool_calls: [{
+          id: "call_shell",
+          type: "function",
+          function: { name: "local_shell", arguments: JSON.stringify({ command: "ls -la" }) }
+        }]
+      }
+    }]
+  }, { responseId: "resp_shell", toolContext });
+
+  assert.equal(response.output[0].type, "custom_tool_call");
+  assert.equal(response.output[0].name, "local_shell");
+  assert.equal(response.output[0].input, JSON.stringify({ command: "ls -la" }));
+});
+
+test("local_shell_call history 转回 shell 代理工具", () => {
+  const messages = normalizeInputToMessages([
+    { type: "local_shell_call", call_id: "c1", action: { command: "pwd" }, status: "completed" },
+    { type: "local_shell_call_output", call_id: "c1", output: "/Users/test" }
+  ]);
+  assert.equal(messages[0].role, "assistant");
+  assert.equal(messages[0].tool_calls[0].function.name, "shell");
+  assert.equal(messages[1].role, "tool");
+  assert.equal(messages[1].content, "/Users/test");
+});
+
+test("apply_patch_call history 转回 apply_patch 代理工具", () => {
+  const toolContext = buildCodexToolContext([
+    { type: "custom", name: "apply_patch", format: { definition: "begin_patch end_patch" } }
+  ]);
+  const messages = normalizeInputToMessages([
+    {
+      type: "apply_patch_call", call_id: "c2", name: "apply_patch",
+      operation: { type: "create_file", path: "new.js", diff: "content" },
+      status: "completed"
+    },
+    { type: "apply_patch_call_output", call_id: "c2", output: "ok" }
+  ], { toolContext });
+  assert.equal(messages[0].role, "assistant");
+  assert.ok(messages[0].tool_calls[0].function.name.includes("apply_patch"));
+  assert.equal(messages[1].role, "tool");
+  assert.equal(messages[1].content, "ok");
 });

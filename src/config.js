@@ -11,10 +11,10 @@ const DEFAULT_CONFIG = {
   host: '127.0.0.1',
   port: 8787,
   
-  // 上游配置
+  // 上游配置（仅 upstreamBaseUrl 必填，model/key 由客户端提供）
   upstreamBaseUrl: '',
   upstreamApiKey: '',
-  model: 'glm-5',
+  model: '',
   
   // 功能配置
   enableReasoning: false,
@@ -216,8 +216,8 @@ export function loadConfig(argv = process.argv) {
  * @param {Object} config - 配置对象
  */
 export function validateConfig(config) {
-  if (!config.upstreamBaseUrl && !config.upstreamApiKey) {
-    console.warn('警告：未配置上游基础 URL 和 API 密钥，请通过环境变量或命令行参数设置');
+  if (!config.upstreamBaseUrl) {
+    console.warn('警告：未配置上游基础 URL，请通过环境变量或命令行参数设置 UPSTREAM_BASE_URL');
   }
   
   if (config.port < 1 || config.port > 65535) {

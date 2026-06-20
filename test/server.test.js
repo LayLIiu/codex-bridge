@@ -43,7 +43,6 @@ test("bridge 把 /v1/responses 请求转到上游 Chat Completions 并转回 fun
     handleRequest(request, response, {
       chatCompletionsUrl: `${serverUrl(upstream)}/v1/chat/completions`,
       upstreamApiKey: "test-key",
-      modelOverride: "qwen-test",
       strictNativeTools: false
     }).catch((error) => {
       writeJson(response, 500, { error: error.message });
@@ -72,7 +71,7 @@ test("bridge 把 /v1/responses 请求转到上游 Chat Completions 并转回 fun
   const body = await response.json();
 
   assert.equal(response.status, 200);
-  assert.equal(receivedChatRequest.model, "qwen-test");
+  assert.equal(receivedChatRequest.model, "codex-model-name");
   assert.equal(receivedChatRequest.messages[0].role, "system");
   assert.match(receivedChatRequest.messages[0].content, /Codex Bridge/);
   assert.equal(receivedChatRequest.messages[1].content, "执行 pwd");
@@ -89,7 +88,7 @@ test("bridge 把 /v1/responses 请求转到上游 Chat Completions 并转回 fun
   ]);
 });
 
-test("bridge 使用 config.model 覆盖 Codex 请求模型名", async (t) => {
+test("bridge 透传客户端的模型名（不覆盖）", async (t) => {
   let receivedChatRequest;
 
   const upstream = http.createServer(async (request, response) => {
@@ -109,7 +108,6 @@ test("bridge 使用 config.model 覆盖 Codex 请求模型名", async (t) => {
     handleRequest(request, response, {
       chatCompletionsUrl: `${serverUrl(upstream)}/v1/chat/completions`,
       upstreamApiKey: "test-key",
-      model: "glm-5",
       strictNativeTools: false
     }).catch((error) => {
       writeJson(response, 500, { error: error.message });
@@ -130,7 +128,7 @@ test("bridge 使用 config.model 覆盖 Codex 请求模型名", async (t) => {
   });
 
   assert.equal(response.status, 200);
-  assert.equal(receivedChatRequest.model, "glm-5");
+  assert.equal(receivedChatRequest.model, "codex-model-name");
   assert.deepEqual(receivedChatRequest.messages, [
     { role: "system", content: "保持简洁" },
     { role: "user", content: "你好" }

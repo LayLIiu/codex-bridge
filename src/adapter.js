@@ -92,10 +92,20 @@ export function toChatCompletionsRequest(responsesRequest, options = {}) {
   }));
 
   const chatRequest = {
-    model: options.modelOverride ?? responsesRequest.model,
+    model: responsesRequest.model,
     messages: messages,
     store: false
   };
+
+  // 流式请求时添加 stream_options 以获取 usage 信息
+  if (responsesRequest.stream) {
+    chatRequest.stream_options = { include_usage: true };
+  }
+
+  // reasoning.effort → 上游格式映射
+  if (responsesRequest.reasoning?.effort) {
+    chatRequest.reasoning_effort = mapReasoningEffort(responsesRequest.reasoning.effort);
+  }
 
   // 推理模式：只在明确启用时才发送 thinking 参数
   // 不发送 thinking 字段 = 让上游自行决定是否启用推理
@@ -167,13 +177,32 @@ export function fromChatCompletionsResponse(chatResponse, options = {}) {
     id: responseId,
     object: "response",
     created_at: chatResponse?.created ?? Math.floor(Date.now() / 1000),
-    model: chatResponse?.model,
     status: "completed",
+    background: false,
+    completed_at: Math.floor(Date.now() / 1000),
+    error: null,
+    frequency_penalty: options.request?.frequency_penalty ?? 0,
+    incomplete_details: null,
+    instructions: options.request?.instructions ?? null,
+    max_output_tokens: options.request?.max_output_tokens ?? null,
+    max_tool_calls: options.request?.max_tool_calls ?? null,
+    model: chatResponse?.model,
+    moderation: null,
     output,
+    parallel_tool_calls: options.request?.parallel_tool_calls ?? true,
+    presence_penalty: options.request?.presence_penalty ?? 0,
+    previous_response_id: options.request?.previous_response_id ?? null,
+    reasoning: options.request?.reasoning ?? { context: "current_turn", effort: "none", summary: null },
+    service_tier: options.request?.service_tier ?? "default",
+    store: false,
+    temperature: options.request?.temperature ?? 1,
+    text: options.request?.text ?? { format: { type: "text" }, verbosity: "medium" },
+    tool_choice: options.request?.tool_choice ?? "auto",
+    top_logprobs: options.request?.top_logprobs ?? 0,
+    top_p: options.request?.top_p ?? 0.98,
+    truncation: options.request?.truncation ?? "disabled",
     output_text: getOutputText(output),
     usage: normalizeUsage(chatResponse?.usage),
-    error: null,
-    incomplete_details: null,
     finish_reason: choice?.finish_reason
   };
 }
@@ -205,6 +234,9 @@ export function createStreamConverter(responseId, model, options = {}) {
   let textContentIndex = 0;
   let sequenceNumber = 0;
   let accumulatedText = "";
+  const createdAt = options.createdAt ?? Math.floor(Date.now() / 1000);
+  const responseSuffix = responseId.replace(/^resp_/, "");
+  const messageItemId = `msg_${responseSuffix}`;
   const enableReasoning = options.enableReasoning === true;
   const textFilter = createReasoningFilter({ enabled: !enableReasoning });
 
@@ -222,6 +254,39 @@ export function createStreamConverter(responseId, model, options = {}) {
     return event;
   }
 
+  function responseSnapshot(status, output = [], usage = undefined) {
+    return {
+      id: responseId,
+      object: "response",
+      created_at: createdAt,
+      status,
+      background: false,
+      completed_at: status === "completed" ? Math.floor(Date.now() / 1000) : null,
+      error: null,
+      frequency_penalty: 0,
+      incomplete_details: null,
+      instructions: options.instructions ?? null,
+      max_output_tokens: options.maxOutputTokens ?? null,
+      max_tool_calls: null,
+      model,
+      moderation: null,
+      output,
+      parallel_tool_calls: options.parallelToolCalls ?? true,
+      presence_penalty: 0,
+      previous_response_id: options.previousResponseId ?? null,
+      reasoning: options.reasoning ?? { context: "current_turn", effort: "none", summary: null },
+      service_tier: status === "completed" ? "default" : "auto",
+      store: false,
+      temperature: options.temperature ?? 1,
+      text: options.text ?? { format: { type: "text" }, verbosity: "medium" },
+      tool_choice: options.toolChoice ?? "auto",
+      top_logprobs: 0,
+      top_p: options.topP ?? 0.98,
+      truncation: options.truncation ?? "disabled",
+      usage
+    };
+  }
+
   return {
     processChunk(chunk) {
       const events = [];
@@ -232,23 +297,11 @@ export function createStreamConverter(responseId, model, options = {}) {
       if (!started) {
         events.push(seq({
           type: "response.created",
-          response: {
-            id: responseId,
-            object: "response",
-            model,
-            status: "in_progress",
-            output: []
-          }
+          response: responseSnapshot("in_progress", [])
         }));
         events.push(seq({
           type: "response.in_progress",
-          response: {
-            id: responseId,
-            object: "response",
-            model,
-            status: "in_progress",
-            output: []
-          }
+          response: responseSnapshot("in_progress", [])
         }));
         started = true;
       }
@@ -263,29 +316,34 @@ export function createStreamConverter(responseId, model, options = {}) {
         accumulatedText += textDelta;
         if (!textItemActive) {
           events.push(seq({
-            type: "response.output_item.added",
-            output_index: outputIndex,
-            item: {
-              type: "message",
-              id: `${responseId}_msg`,
-              role: "assistant",
-              status: "in_progress",
-              content: []
-            }
-          }));
-          events.push(seq({
-            type: "response.content_part.added",
-            output_index: outputIndex,
-            content_index: textContentIndex,
-            part: { type: "output_text", text: "", annotations: [] }
-          }));
+              type: "response.output_item.added",
+              output_index: outputIndex,
+              item: {
+                type: "message",
+                id: messageItemId,
+                role: "assistant",
+                status: "in_progress",
+                content: [],
+                phase: "final_answer"
+              }
+            }));
+            events.push(seq({
+              type: "response.content_part.added",
+              output_index: outputIndex,
+              content_index: textContentIndex,
+              item_id: messageItemId,
+              part: { type: "output_text", text: "", annotations: [], logprobs: [] }
+            }));
           textItemActive = true;
         }
         events.push(seq({
           type: "response.output_text.delta",
           output_index: outputIndex,
           content_index: textContentIndex,
-          delta: textDelta
+          item_id: messageItemId,
+          delta: textDelta,
+          logprobs: [],
+          obfuscation: makeObfuscation(sequenceNumber)
         }));
       }
 
@@ -297,7 +355,8 @@ export function createStreamConverter(responseId, model, options = {}) {
           if (tc.id || !toolCallStates.has(idx)) {
             // 新工具调用开始
             toolCallStates.set(idx, {
-              id: tc.id ?? `call_${responseId}_${idx}`,
+              callId: tc.id ?? `call_${responseId}_${idx}`,
+              itemId: null,
               name: tc.function?.name ?? "",
               args: ""
             });
@@ -317,10 +376,11 @@ export function createStreamConverter(responseId, model, options = {}) {
           // 第一个分片到达时发出 output_item.added
           if (!state.emitted) {
             const itemOutputIndex = outputIndex + (textItemActive ? 1 : 0) + idx;
+            state.itemId = makeToolItemId(responseId, idx, state.name, toolContext);
             const addedItem = remapToolCallItem({
               type: "function_call",
-              id: state.id,
-              call_id: state.id,
+              id: state.itemId,
+              call_id: state.callId,
               name: state.name,
               arguments: "",
               status: "in_progress"
@@ -337,23 +397,26 @@ export function createStreamConverter(responseId, model, options = {}) {
           if (tc.function?.arguments) {
             const partialItem = remapToolCallItem({
               type: "function_call",
-              id: state.id,
-              call_id: state.id,
+              id: state.itemId,
+              call_id: state.callId,
               name: state.name,
               arguments: state.args,
               status: "in_progress"
             }, toolContext);
-            events.push(seq({
-              type: partialItem.type === "custom_tool_call"
-                ? "response.custom_tool_call_input.delta"
-                : "response.function_call_arguments.delta",
-              output_index: state.itemOutputIndex,
-              item_id: state.id,
-              call_id: state.id,
-              delta: partialItem.type === "custom_tool_call"
-                ? reconstructCustomToolInput(toolContext.customTools.get(state.name), state.name, tc.function.arguments)
-                : tc.function.arguments
-            }));
+            if (partialItem.type !== "custom_tool_call") {
+              events.push(seq({
+                type: "response.function_call_arguments.delta",
+                output_index: state.itemOutputIndex,
+                item_id: state.itemId,
+                call_id: state.callId,
+                delta: tc.function.arguments,
+                obfuscation: makeObfuscation(sequenceNumber)
+              }));
+            }
+            // custom_tool_call: 累积 input，在 finish 时拆 token 发 delta
+            if (partialItem.type === "custom_tool_call") {
+              state.pendingCustomInput = partialItem.input ?? "";
+            }
           }
         }
       }
@@ -365,23 +428,27 @@ export function createStreamConverter(responseId, model, options = {}) {
             type: "response.output_text.done",
             output_index: outputIndex,
             content_index: textContentIndex,
-            text: accumulatedText
+            item_id: messageItemId,
+            text: accumulatedText,
+            logprobs: []
           }));
           events.push(seq({
             type: "response.content_part.done",
             output_index: outputIndex,
             content_index: textContentIndex,
-            part: { type: "output_text", text: accumulatedText, annotations: [] }
+            item_id: messageItemId,
+            part: { type: "output_text", text: accumulatedText, annotations: [], logprobs: [] }
           }));
           events.push(seq({
             type: "response.output_item.done",
             output_index: outputIndex,
             item: {
               type: "message",
-              id: `${responseId}_msg`,
+              id: messageItemId,
               role: "assistant",
               status: "completed",
-              content: [{ type: "output_text", text: accumulatedText, annotations: [] }]
+              content: [{ type: "output_text", text: accumulatedText, annotations: [], logprobs: [] }],
+              phase: "final_answer"
             }
           }));
         }
@@ -390,21 +457,40 @@ export function createStreamConverter(responseId, model, options = {}) {
           if (!state.emitted) continue;
           const doneItem = remapToolCallItem({
             type: "function_call",
-            id: state.id,
-            call_id: state.id,
+            id: state.itemId,
+            call_id: state.callId,
             name: state.name,
             arguments: state.args,
             status: "completed"
           }, toolContext);
-          events.push(seq({
+          if (doneItem.type === "custom_tool_call" && doneItem.input) {
+            // 拆成小 delta 逐 token 发出，模拟原生 Codex 流式 patch 输入
+            const input = doneItem.input;
+            for (let i = 0; i < input.length; i += 12) {
+              events.push(seq({
+                type: "response.custom_tool_call_input.delta",
+                output_index: state.itemOutputIndex,
+                item_id: state.itemId,
+                call_id: state.callId,
+                delta: input.slice(i, i + 12),
+                obfuscation: makeObfuscation(sequenceNumber)
+              }));
+            }
+          }
+          const donePayload = {
             type: doneItem.type === "custom_tool_call"
               ? "response.custom_tool_call_input.done"
               : "response.function_call_arguments.done",
             output_index: state.itemOutputIndex,
-            item_id: state.id,
-            call_id: state.id,
-            arguments: doneItem.arguments ?? doneItem.input ?? state.args
-          }));
+            item_id: state.itemId,
+            call_id: state.callId
+          };
+          if (doneItem.type === "custom_tool_call") {
+            donePayload.input = doneItem.input ?? "";
+          } else {
+            donePayload.arguments = doneItem.arguments ?? state.args;
+          }
+          events.push(seq(donePayload));
           events.push(seq({
             type: "response.output_item.done",
             output_index: state.itemOutputIndex,
@@ -416,7 +502,7 @@ export function createStreamConverter(responseId, model, options = {}) {
         if (accumulatedText) {
           outputItems.push({
             type: "message",
-            id: `${responseId}_msg`,
+            id: messageItemId,
             role: "assistant",
             status: "completed",
             content: [{ type: "output_text", text: accumulatedText, annotations: [] }]
@@ -425,8 +511,8 @@ export function createStreamConverter(responseId, model, options = {}) {
         for (const [idx, state] of toolCallStates) {
           outputItems.push(remapToolCallItem({
             type: "function_call",
-            id: state.id,
-            call_id: state.id,
+            id: state.itemId,
+            call_id: state.callId,
             name: state.name,
             arguments: state.args,
             status: "completed"
@@ -436,13 +522,8 @@ export function createStreamConverter(responseId, model, options = {}) {
         events.push(seq({
           type: "response.completed",
           response: {
-            id: responseId,
-            object: "response",
-            model,
-            status: "completed",
-            output: outputItems,
-            output_text: getOutputText(outputItems),
-            usage: normalizeUsage(chunk?.usage)
+            ...responseSnapshot("completed", outputItems, normalizeUsage(chunk?.usage)),
+            output_text: getOutputText(outputItems)
           }
         }));
       }
@@ -450,6 +531,24 @@ export function createStreamConverter(responseId, model, options = {}) {
       return flush(events);
     }
   };
+}
+
+function makeToolItemId(responseId, index, toolName, toolContext) {
+  const suffix = responseId.replace(/^resp_/, "");
+  const customSpec = toolContext?.customTools?.get(toolName);
+  const prefix = customSpec ? "ctc" : "fc";
+  return `${prefix}_${suffix}_${index}`;
+}
+
+function makeObfuscation(seed) {
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let value = "";
+  let n = Math.abs(Number(seed) || 0) + 17;
+  for (let i = 0; i < 14; i += 1) {
+    n = (n * 1103515245 + 12345) >>> 0;
+    value += alphabet[n % alphabet.length];
+  }
+  return value;
 }
 
 export function normalizeInputToMessages(input, options = {}) {
@@ -506,6 +605,57 @@ export function normalizeInputToMessages(input, options = {}) {
             }
           }
         ]
+      });
+      continue;
+    }
+
+    // 原生 local_shell_call → 转回 shell 代理工具
+    if (item.type === "local_shell_call") {
+      const command = item.action?.command ?? "";
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: item.call_id ?? item.id,
+            type: "function",
+            function: {
+              name: "shell",
+              arguments: JSON.stringify({ command })
+            }
+          }
+        ]
+      });
+      continue;
+    }
+
+    // 原生 apply_patch_call → 转回 apply_patch 代理工具
+    if (item.type === "apply_patch_call") {
+      const patchText = rebuildApplyPatchText(item.operation);
+      const { name, arguments: args } = buildCustomToolHistoryArguments("apply_patch", patchText, toolContext);
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: item.call_id ?? item.id,
+            type: "function",
+            function: {
+              name,
+              arguments: args
+            }
+          }
+        ]
+      });
+      continue;
+    }
+
+    // 原生 local_shell_call_output / apply_patch_call_output → tool 消息
+    if (item.type === "local_shell_call_output" || item.type === "apply_patch_call_output") {
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id,
+        content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "")
       });
       continue;
     }
@@ -884,7 +1034,40 @@ function makeApplyPatchProxyTools(name, description) {
 }
 
 function makeFunctionTool(name, description, parameters) {
-  return { type: "function", function: { name, description, parameters } };
+  return { type: "function", function: { name, description, parameters: normalizeToolParameters(parameters) } };
+}
+
+/**
+ * 规范化 tool parameters，补齐严格校验所需字段。
+ * 部分上游镜像在未提供 required/type/properties 时会报错：
+ * "Invalid schema for function ...: None is not of type 'array'"
+ */
+function normalizeToolParameters(params) {
+  if (!params || typeof params !== "object") {
+    return { type: "object", properties: {}, required: [] };
+  }
+  const result = { ...params };
+  if (!result.type) result.type = "object";
+  if (!result.properties) result.properties = {};
+  if (!result.required) result.required = [];
+  return result;
+}
+
+/**
+ * reasoning.effort 映射：Codex 的 effort 级别 → 上游格式
+ * ccx 支持 6 级：none/auto/minimal/low/medium/high/xhigh
+ */
+function mapReasoningEffort(effort) {
+  switch (effort) {
+    case "none": return "none";
+    case "auto": return "auto";
+    case "minimal": return "low";
+    case "low": return "low";
+    case "medium": return "medium";
+    case "high": return "high";
+    case "xhigh": return "high";
+    default: return "auto";
+  }
 }
 
 function patchProxyDescription(description, action, fallback) {
@@ -933,6 +1116,30 @@ function remapToolCallItem(item, toolContext = createEmptyToolContext()) {
   const customSpec = toolContext.customTools.get(item.name);
   if (!customSpec) return item;
 
+  if (customSpec.kind === "apply_patch") {
+    const input = reconstructCustomToolInput(customSpec, item.name, item.arguments ?? "{}");
+    return {
+      type: "custom_tool_call",
+      id: item.id,
+      call_id: item.call_id,
+      name: customSpec.originalName,
+      input,
+      status: item.status ?? "completed"
+    };
+  }
+
+  if (customSpec.kind === "exec" || customSpec.kind === "builtin") {
+    const input = reconstructCustomToolInput(customSpec, item.name, item.arguments ?? "{}");
+    return {
+      type: "custom_tool_call",
+      id: item.id,
+      call_id: item.call_id,
+      name: customSpec.originalName,
+      input,
+      status: item.status ?? "completed"
+    };
+  }
+
   const input = reconstructCustomToolInput(customSpec, item.name, item.arguments ?? "{}");
   return {
     type: "custom_tool_call",
@@ -942,6 +1149,27 @@ function remapToolCallItem(item, toolContext = createEmptyToolContext()) {
     input,
     status: item.status ?? "completed"
   };
+}
+
+/**
+ * 将 apply_patch_call 的 operation 转回 V4A patch 格式
+ * 用于 history replay
+ */
+function rebuildApplyPatchText(operation) {
+  if (!operation) return "";
+  const { type, path, diff } = operation;
+
+  if (type === "create_file") {
+    return `*** Begin Patch\n*** Add File: ${path}\n${diff}\n*** End Patch`;
+  }
+  if (type === "delete_file") {
+    return `*** Begin Patch\n*** Delete File: ${path}\n*** End Patch`;
+  }
+  if (type === "update_file") {
+    return `*** Begin Patch\n*** Update File: ${path}\n${diff}\n*** End Patch`;
+  }
+  // 兜底
+  return diff || "";
 }
 
 function reconstructCustomToolInput(spec, upstreamName, rawArguments) {
@@ -1163,7 +1391,7 @@ export function mapTools(responseTools, {
         function: {
           name,
           description: tool.description ?? tool.function?.description,
-          parameters: tool.parameters ?? tool.function?.parameters ?? { type: "object", properties: {} },
+          parameters: normalizeToolParameters(tool.parameters ?? tool.function?.parameters),
           ...((tool.strict ?? tool.function?.strict) === undefined ? {} : { strict: tool.strict ?? tool.function?.strict })
         }
       });
@@ -1602,4 +1830,127 @@ export function buildRetryMessages(originalMessages, responseOutput, issues) {
   });
 
   return retryMessages;
+}
+
+// ============================================================
+// 历史回放：custom_tool_call → 上游 function call arguments
+// ============================================================
+
+/**
+ * 把 Codex custom_tool_call 的 input 转成上游 Chat Completions function call arguments，
+ * 用于多轮对话历史回放。
+ *
+ * @param {object} toolContext - buildCodexToolContext 返回的上下文
+ * @param {string} originalName - Codex 端的原始工具名（如 "apply_patch"）
+ * @param {string} input - custom_tool_call 的 input 文本
+ * @returns {{ name: string, arguments: string }} - 上游函数名和 JSON arguments
+ */
+export function buildCustomToolCallHistoryArguments(toolContext, originalName, input) {
+  const spec = toolContext.customTools.get(originalName);
+
+  if (!spec) {
+    return { name: originalName, arguments: JSON.stringify({ input }) };
+  }
+
+  if (spec.kind === "apply_patch") {
+    const parsed = parseApplyPatchOperations(input);
+    if (!parsed || parsed.length === 0) {
+      return {
+        name: `${originalName}_batch`,
+        arguments: JSON.stringify({ operations: [], raw_patch: input })
+      };
+    }
+    if (parsed.length === 1) {
+      const action = chooseSingleProxyAction(parsed[0].type);
+      return {
+        name: `${originalName}_${action}`,
+        arguments: buildSingleOpArgsJSON(parsed[0])
+      };
+    }
+    return {
+      name: `${originalName}_batch`,
+      arguments: buildBatchOpsJSON(parsed)
+    };
+  }
+
+  // 通用 custom tool
+  return {
+    name: originalName,
+    arguments: JSON.stringify({ input })
+  };
+}
+
+/**
+ * 简化版历史回放：不依赖 toolContext，自动检测 apply_patch 并转换。
+ * 用于没有完整上下文时的快速转换。
+ *
+ * @param {string} name - 工具名
+ * @param {string} input - custom_tool_call 的 input
+ * @returns {{ name: string, arguments: string }} - 上游函数名和 JSON arguments
+ */
+export function replayCustomToolCall(name, input) {
+  if (
+    name === "apply_patch" ||
+    (typeof input === "string" && input.startsWith("*** Begin Patch") && input.includes("*** End Patch"))
+  ) {
+    const parsed = parseApplyPatchOperations(input);
+    if (!parsed || parsed.length === 0) {
+      return {
+        name: `${name}_batch`,
+        arguments: JSON.stringify({ operations: [], raw_patch: input })
+      };
+    }
+    if (parsed.length === 1) {
+      const action = chooseSingleProxyAction(parsed[0].type);
+      return {
+        name: `${name}_${action}`,
+        arguments: buildSingleOpArgsJSON(parsed[0])
+      };
+    }
+    return {
+      name: `${name}_batch`,
+      arguments: buildBatchOpsJSON(parsed)
+    };
+  }
+
+  // 通用 custom tool
+  return {
+    name,
+    arguments: JSON.stringify({ input })
+  };
+}
+
+function chooseSingleProxyAction(opType) {
+  if (["add_file", "delete_file", "update_file", "replace_file"].includes(opType)) {
+    return opType;
+  }
+  return "batch";
+}
+
+function buildSingleOpArgsJSON(op) {
+  switch (op.type) {
+    case "add_file":
+    case "replace_file":
+      return JSON.stringify({ path: op.path, content: op.content });
+    case "delete_file":
+      return JSON.stringify({ path: op.path });
+    case "update_file": {
+      const obj = { path: op.path, hunks: op.hunks ?? [] };
+      if (op.move_to) obj.move_to = op.move_to;
+      return JSON.stringify(obj);
+    }
+    default:
+      return JSON.stringify({ path: op.path });
+  }
+}
+
+function buildBatchOpsJSON(ops) {
+  const batchOps = ops.map(op => {
+    const item = { type: op.type, path: op.path };
+    if (op.move_to) item.move_to = op.move_to;
+    if (op.content) item.content = op.content;
+    if (Array.isArray(op.hunks) && op.hunks.length > 0) item.hunks = op.hunks;
+    return item;
+  });
+  return JSON.stringify({ operations: batchOps });
 }

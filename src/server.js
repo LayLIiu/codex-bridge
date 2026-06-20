@@ -3,6 +3,8 @@ import http from "node:http";
 import { stdin, stdout, stderr, exit } from "node:process";
 import { pathToFileURL } from "node:url";
 import crypto from "node:crypto";
+import { writeFileSync, appendFileSync, mkdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import {
   createStreamConverter,
   fromChatCompletionsResponse,
@@ -37,6 +39,41 @@ const MAX_STORED_RESPONSES = 200;
 let lastDebugEntry = null;
 let activeUpstreamRequests = 0;
 const upstreamQueue = [];
+
+// 文件日志：写入 ~/.codex/bridge-debug.log
+const LOG_DIR = join(process.env.HOME ?? "/tmp", ".codex");
+const LOG_FILE = join(LOG_DIR, "bridge-debug.log");
+
+function fileLog(entry) {
+  try {
+    if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
+    appendFileSync(LOG_FILE, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
+  } catch {}
+}
+
+function clearLogFile() {
+  try {
+    if (existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
+    writeFileSync(LOG_FILE, "");
+  } catch {}
+}
+
+function summarizeRequestInputForLog(input) {
+  const items = Array.isArray(input) ? input : input === undefined ? [] : [input];
+  return items.map((item) => {
+    if (typeof item === "string") {
+      return { type: "message", role: "user", content: item.slice(0, 200) };
+    }
+    if (!item || typeof item !== "object") {
+      return { type: typeof item, content: item };
+    }
+    return {
+      type: item.type,
+      role: item.role,
+      content: typeof item.content === "string" ? item.content.slice(0, 200) : item.content
+    };
+  });
+}
 
 /**
  * 带重试的 fetch：对 5xx、429 和网络错误做退避重试。
@@ -110,8 +147,14 @@ export async function handleRequest(request, response, config) {
       ok: true,
       service: "codex-bridge",
       upstream: config.chatCompletionsUrl ?? null,
-      model: config.modelOverride ?? config.model ?? null
+      model: "passthrough (由客户端提供)",
+      logFile: LOG_FILE
     });
+  }
+
+  if (request.method === "POST" && url.pathname === "/v1/debug/clear-log") {
+    clearLogFile();
+    return writeJson(response, 200, { ok: true, message: "日志已清空" });
   }
 
   if (request.method === "GET" && url.pathname === "/v1/debug/last") {
@@ -122,11 +165,10 @@ export async function handleRequest(request, response, config) {
   }
 
   if (request.method === "GET" && url.pathname === "/v1/models") {
-    const model = config.modelOverride ?? config.model ?? "default";
     return writeJson(response, 200, {
       object: "list",
       models: [
-        { id: model, slug: model, display_name: model, object: "model", created: Date.now(), owned_by: "bridge" }
+        { id: "passthrough", slug: "passthrough", display_name: "Model provided by client", object: "model", created: Date.now(), owned_by: "bridge" }
       ]
     });
   }
@@ -160,9 +202,16 @@ export async function handleRequest(request, response, config) {
     return writeJson(response, 400, makeError(`JSON 请求体解析失败：${error.message}`, "invalid_request_error", "invalid_json"));
   }
 
-  const modelOverride = config.modelOverride ?? config.model;
+  // 文件日志：记录完整请求
+  fileLog({
+    event: "request_incoming",
+    tools: responsesRequest.tools?.map(t => ({ type: t.type, name: t.name ?? t.function?.name })) ?? [],
+    model: responsesRequest.model,
+    input: summarizeRequestInputForLog(responsesRequest.input),
+    stream: responsesRequest.stream ?? false
+  });
+
   const { chatRequest, warnings, conversationId, toolContext } = toChatCompletionsRequest(responsesRequest, {
-    modelOverride,
     onUnsupportedNativeTool: config.strictNativeTools ? "error" : "warn",
     enableReasoning: config.enableReasoning,
     simulateNativeTools: config.simulateNativeTools ?? false
@@ -171,7 +220,7 @@ export async function handleRequest(request, response, config) {
   // ── Session 关联 ──
   const previousResponseId = responsesRequest.previous_response_id || responsesRequest.conversation;
   const existingSession = previousResponseId ? lookupSessionByResponseId(previousResponseId) : null;
-  const model = modelOverride ?? responsesRequest.model ?? 'unknown';
+  const model = responsesRequest.model ?? 'unknown';
   const effort = responsesRequest.reasoning?.effort ?? 'medium';
   const inputItems = Array.isArray(responsesRequest.input) ? responsesRequest.input : [];
 
@@ -247,7 +296,7 @@ export async function handleRequest(request, response, config) {
 
   // ── 转发请求 ──
   if (responsesRequest.stream) {
-    return handleStreamRequest(request, response, config, chatRequest, warnings, sessionId, turnId, toolContext);
+    return handleStreamRequest(request, response, config, chatRequest, warnings, sessionId, turnId, toolContext, responsesRequest);
   }
 
   // 非流式（带连接重试）
@@ -276,7 +325,8 @@ export async function handleRequest(request, response, config) {
     repairTextToolCalls: config.repairTextToolCalls ?? true,
     availableToolNames: getChatToolNames(chatRequest),
     availableTools: chatRequest.tools ?? [],
-    toolContext
+    toolContext,
+    request: responsesRequest
   });
   if (warnings.length > 0) {
     responsesBody.bridge_warnings = warnings;
@@ -318,7 +368,8 @@ export async function handleRequest(request, response, config) {
           repairTextToolCalls: config.repairTextToolCalls ?? true,
           availableToolNames: toolNames,
           availableTools: chatRequest.tools ?? [],
-          toolContext
+          toolContext,
+          request: responsesRequest
         });
         if (!responsesBody.bridge_warnings) responsesBody.bridge_warnings = [];
         responsesBody.bridge_warnings.push(`工具调用重试第 ${retryCount + 1} 次成功`);
@@ -383,10 +434,24 @@ export async function handleRequest(request, response, config) {
     retries: retryCount > 0 ? retryCount : undefined
   };
 
+  // 文件日志：记录完整响应
+  fileLog({
+    event: "response_outgoing",
+    responseId: responsesBody.id,
+    output: responsesBody.output?.map(o => ({
+      type: o.type,
+      name: o.name,
+      call_id: o.call_id,
+      action: o.action,
+      operation: o.operation,
+      content: o.content?.map(c => ({ type: c.type, text: c.text?.slice(0, 200) }))
+    }))
+  });
+
   writeJson(response, 200, responsesBody);
 }
 
-async function handleStreamRequest(request, response, config, chatRequest, warnings, sessionId, turnId, toolContext) {
+async function handleStreamRequest(request, response, config, chatRequest, warnings, sessionId, turnId, toolContext, responsesRequest = {}) {
   chatRequest.stream = true;
   chatRequest.stream_options = { include_usage: true };
 
@@ -416,7 +481,21 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
   });
 
   const responseId = makeResponseId();
-  const converter = createStreamConverter(responseId, chatRequest.model, { enableReasoning: config.enableReasoning, toolContext });
+  const converter = createStreamConverter(responseId, chatRequest.model, {
+    enableReasoning: config.enableReasoning,
+    toolContext,
+    instructions: responsesRequest.instructions ?? null,
+    maxOutputTokens: responsesRequest.max_output_tokens ?? null,
+    previousResponseId: responsesRequest.previous_response_id ?? null,
+    reasoning: responsesRequest.reasoning
+      ? { context: "current_turn", effort: responsesRequest.reasoning.effort ?? "none", summary: responsesRequest.reasoning.summary ?? null }
+      : undefined,
+    toolChoice: responsesRequest.tool_choice ?? "auto",
+    parallelToolCalls: responsesRequest.parallel_tool_calls ?? true,
+    temperature: responsesRequest.temperature ?? 1,
+    topP: responsesRequest.top_p ?? 0.98,
+    truncation: responsesRequest.truncation ?? "disabled"
+  });
 
   if (warnings.length > 0) {
     for (const w of warnings) {
@@ -558,6 +637,16 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
       rememberResponse(completedResponse);
     }
 
+    // 文件日志：记录流式响应结果
+    fileLog({
+      event: "stream_response_done",
+      responseId,
+      toolCalls: Array.from(toolCallMap.values()).map(tc => ({
+        id: tc.id, name: tc.name, type: tc.type, arguments: tc.arguments?.slice(0, 500)
+      })),
+      assistantContent: assistantContent?.slice(0, 500)
+    });
+
     response.end();
   }
 }
@@ -631,7 +720,8 @@ async function readJsonBody(request) {
 
 function buildUpstreamHeaders(request, config) {
   const headers = { "content-type": "application/json" };
-  const authorization = config.upstreamApiKey ? `Bearer ${config.upstreamApiKey}` : request.headers.authorization;
+  // 直接透传客户端的 Authorization，config 里的 key 仅作为兜底
+  const authorization = request.headers.authorization || (config.upstreamApiKey ? `Bearer ${config.upstreamApiKey}` : null);
   if (authorization) headers.authorization = authorization;
   return headers;
 }
