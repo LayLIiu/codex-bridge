@@ -1,0 +1,40 @@
+{
+  "name": "codex-bridge-gui",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Codex Bridge GUI Panel",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:win": "electron-builder --win"
+  },
+  "build": {
+    "appId": "com.codex-bridge.gui",
+    "productName": "Codex Bridge",
+    "directories": { "output": "dist" },
+    "win": {
+      "target": ["nsis"],
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "Codex Bridge"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "renderer.js",
+      "assets/**"
+    ],
+    "extraResources": [
+      { "from": "../src", "to": "src" }
+    ]
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  }
+}
