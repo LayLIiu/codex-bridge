@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1350" viewBox="0 0 1080 1350">
+  <defs>
+    <style>
+      .bg{fill:#f7f8fb}.ink{fill:#111827}.muted{fill:#667085}.blue{fill:#2563eb}.green{fill:#059669}.line{stroke:#111827;stroke-width:3;fill:none}.soft{fill:#fff;stroke:#d9dee8;stroke-width:2}.pill{fill:#eef4ff}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace}.sans{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",Arial,sans-serif}
+    </style>
+  </defs>
+  <rect class="bg" width="1080" height="1350"/>
+  <circle cx="917" cy="148" r="92" fill="#e6f4ff"/>
+  <circle cx="116" cy="1118" r="118" fill="#ecfdf3"/>
+  <text x="80" y="142" class="sans muted" font-size="32" font-weight="700">开源项目分享</text>
+  <text x="80" y="245" class="sans ink" font-size="86" font-weight="800">Codex Bridge</text>
+  <text x="80" y="320" class="sans ink" font-size="46" font-weight="700">让 Codex 接入国产模型</text>
+  <text x="80" y="385" class="sans muted" font-size="32">Responses API ↔ Chat Completions API</text>
+
+  <rect x="92" y="505" width="896" height="410" rx="28" class="soft"/>
+  <rect x="146" y="612" width="210" height="150" rx="22" fill="#f0f6ff" stroke="#b9cdfb" stroke-width="2"/>
+  <rect x="435" y="584" width="210" height="205" rx="26" fill="#111827"/>
+  <rect x="724" y="612" width="210" height="150" rx="22" fill="#ecfdf3" stroke="#a9e8c2" stroke-width="2"/>
+  <text x="251" y="684" class="sans ink" font-size="31" text-anchor="middle" font-weight="700">Codex</text>
+  <text x="251" y="730" class="sans muted" font-size="24" text-anchor="middle">Responses</text>
+  <text x="540" y="675" class="sans" fill="#fff" font-size="33" text-anchor="middle" font-weight="800">Bridge</text>
+  <text x="540" y="724" class="mono" fill="#9ca3af" font-size="24" text-anchor="middle">localhost:8787</text>
+  <text x="829" y="684" class="sans ink" font-size="31" text-anchor="middle" font-weight="700">国产模型</text>
+  <text x="829" y="730" class="sans muted" font-size="24" text-anchor="middle">Chat API</text>
+  <path d="M356 687 H435" stroke="#2563eb" stroke-width="8" stroke-linecap="round"/>
+  <path d="M645 687 H724" stroke="#059669" stroke-width="8" stroke-linecap="round"/>
+  <path d="M415 671 l20 16 -20 16" fill="none" stroke="#2563eb" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M704 671 l20 16 -20 16" fill="none" stroke="#059669" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <rect x="80" y="1015" width="280" height="64" rx="32" class="pill"/>
+  <text x="220" y="1058" class="sans blue" font-size="28" text-anchor="middle" font-weight="700">流式输出</text>
+  <rect x="400" y="1015" width="280" height="64" rx="32" fill="#ecfdf3"/>
+  <text x="540" y="1058" class="sans green" font-size="28" text-anchor="middle" font-weight="700">工具调用</text>
+  <rect x="720" y="1015" width="280" height="64" rx="32" fill="#fff7ed"/>
+  <text x="860" y="1058" class="sans" fill="#c2410c" font-size="28" text-anchor="middle" font-weight="700">文件编辑</text>
+
+  <text x="80" y="1195" class="sans ink" font-size="34" font-weight="700">一个本地协议转换层</text>
+  <text x="80" y="1246" class="sans muted" font-size="28">不是替代官方，而是让更多模型能进入 Codex 工作流。</text>
+</svg>

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1350" viewBox="0 0 1080 1350">
+  <defs>
+    <style>
+      .bg{fill:#ffffff}.ink{fill:#111827}.muted{fill:#667085}.card{fill:#f8fafc;stroke:#d0d5dd;stroke-width:2}.dark{fill:#101828}.sans{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+    </style>
+  </defs>
+  <rect class="bg" width="1080" height="1350"/>
+  <text x="80" y="135" class="sans muted" font-size="30" font-weight="700">怎么用</text>
+  <text x="80" y="225" class="sans ink" font-size="72" font-weight="850">三步接入</text>
+  <text x="80" y="292" class="sans muted" font-size="31">本地启动 Bridge，再把 Codex 指向它。</text>
+
+  <rect x="80" y="390" width="920" height="160" rx="28" class="card"/>
+  <text x="125" y="450" class="sans ink" font-size="36" font-weight="850">1. 克隆项目</text>
+  <text x="125" y="505" class="mono muted" font-size="27">git clone https://github.com/LayLIiu/codex-bridge.git</text>
+
+  <rect x="80" y="610" width="920" height="230" rx="28" class="dark"/>
+  <text x="125" y="670" class="sans" fill="#fff" font-size="36" font-weight="850">2. 启动 Bridge</text>
+  <text x="125" y="728" class="mono" fill="#a7f3d0" font-size="24">UPSTREAM_BASE_URL=https://... \</text>
+  <text x="125" y="770" class="mono" fill="#a7f3d0" font-size="24">UPSTREAM_API_KEY=sk-xxx \</text>
+  <text x="125" y="812" class="mono" fill="#a7f3d0" font-size="24">npm start</text>
+
+  <rect x="80" y="900" width="920" height="190" rx="28" class="card"/>
+  <text x="125" y="960" class="sans ink" font-size="36" font-weight="850">3. Codex Base URL 填这个</text>
+  <rect x="125" y="1000" width="700" height="58" rx="18" fill="#eef4ff"/>
+  <text x="156" y="1038" class="mono" fill="#2563eb" font-size="27">http://127.0.0.1:8787/v1</text>
+
+  <rect x="80" y="1160" width="920" height="92" rx="28" fill="#ecfdf3"/>
+  <text x="540" y="1217" class="sans" fill="#047857" font-size="32" text-anchor="middle" font-weight="850">项目已开源：github.com/LayLIiu/codex-bridge</text>
+  <text x="80" y="1305" class="sans muted" font-size="25">建议本地使用，不要直接暴露公网。</text>
+</svg>

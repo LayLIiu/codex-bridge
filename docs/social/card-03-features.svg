@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1350" viewBox="0 0 1080 1350">
+  <defs>
+    <style>
+      .bg{fill:#f8fafc}.ink{fill:#111827}.muted{fill:#667085}.card{fill:#fff;stroke:#d9dee8;stroke-width:2}.sans{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+    </style>
+  </defs>
+  <rect class="bg" width="1080" height="1350"/>
+  <text x="80" y="135" class="sans muted" font-size="30" font-weight="700">它能干什么</text>
+  <text x="80" y="225" class="sans ink" font-size="74" font-weight="850">把国产模型接进</text>
+  <text x="80" y="307" class="sans ink" font-size="74" font-weight="850">Codex 工作流</text>
+
+  <g transform="translate(80 420)">
+    <rect width="420" height="180" rx="28" class="card"/>
+    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">流式响应</text>
+    <text x="38" y="112" class="sans muted" font-size="27">SSE 实时转换</text>
+    <text x="38" y="150" class="mono" fill="#2563eb" font-size="23">response.output_text.delta</text>
+  </g>
+  <g transform="translate(580 420)">
+    <rect width="420" height="180" rx="28" class="card"/>
+    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">工具调用</text>
+    <text x="38" y="112" class="sans muted" font-size="27">function tool 双向映射</text>
+    <text x="38" y="150" class="mono" fill="#059669" font-size="23">tool_calls → function_call</text>
+  </g>
+  <g transform="translate(80 655)">
+    <rect width="420" height="180" rx="28" class="card"/>
+    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">文件编辑</text>
+    <text x="38" y="112" class="sans muted" font-size="27">自动适配 apply_patch</text>
+    <text x="38" y="150" class="mono" fill="#ea580c" font-size="23">+1 / -2 diff 体验</text>
+  </g>
+  <g transform="translate(580 655)">
+    <rect width="420" height="180" rx="28" class="card"/>
+    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">过程反馈</text>
+    <text x="38" y="112" class="sans muted" font-size="27">工具前开场可见</text>
+    <text x="38" y="150" class="mono" fill="#7c3aed" font-size="23">toolProgressMode=preface</text>
+  </g>
+  <g transform="translate(80 890)">
+    <rect width="420" height="180" rx="28" class="card"/>
+    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">自动修复</text>
+    <text x="38" y="112" class="sans muted" font-size="27">文本 JSON / patch</text>
+    <text x="38" y="150" class="mono" fill="#0f766e" font-size="23">repairTextToolCalls</text>
+  </g>
+  <g transform="translate(580 890)">
+    <rect width="420" height="180" rx="28" class="card"/>
+    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">限流重试</text>
+    <text x="38" y="112" class="sans muted" font-size="27">429 / 5xx 退避</text>
+    <text x="38" y="150" class="mono" fill="#be123c" font-size="23">Retry-After aware</text>
+  </g>
+
+  <rect x="80" y="1160" width="920" height="96" rx="30" fill="#111827"/>
+  <text x="540" y="1222" class="sans" fill="#fff" font-size="32" text-anchor="middle" font-weight="800">重点不是换模型，而是让工具调用闭环跑起来</text>
+</svg>
