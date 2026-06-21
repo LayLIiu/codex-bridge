@@ -21,6 +21,7 @@ const DEFAULT_CONFIG = {
   strictNativeTools: false,
   simulateNativeTools: false,
   repairTextToolCalls: true,
+  toolProgressMode: 'preface',
   
   // 对话管理配置
   conversationMaxSize: 1000,
@@ -130,6 +131,8 @@ export function parseArgs(argv) {
       args.simulateNativeTools = true;
     } else if (arg === '--no-repair-text-tool-calls') {
       args.repairTextToolCalls = false;
+    } else if (arg === '--tool-progress-mode') {
+      args.toolProgressMode = argv[++i];
     } else if (arg === '--no-tool-call-retry') {
       args.toolCallRetry = false;
     } else if (arg === '--max-tool-call-retries') {
@@ -194,6 +197,7 @@ export function loadConfig(argv = process.argv) {
     strictNativeTools: pick(args.strictNativeTools, envBool(process.env.BRIDGE_STRICT_NATIVE_TOOLS), envBool(envFileVars.BRIDGE_STRICT_NATIVE_TOOLS), DEFAULT_CONFIG.strictNativeTools),
     simulateNativeTools: pick(args.simulateNativeTools, envBool(process.env.BRIDGE_SIMULATE_NATIVE_TOOLS), envBool(envFileVars.BRIDGE_SIMULATE_NATIVE_TOOLS), DEFAULT_CONFIG.simulateNativeTools),
     repairTextToolCalls: pick(args.repairTextToolCalls, envBool(process.env.BRIDGE_REPAIR_TEXT_TOOL_CALLS), envBool(envFileVars.BRIDGE_REPAIR_TEXT_TOOL_CALLS), DEFAULT_CONFIG.repairTextToolCalls),
+    toolProgressMode: pick(args.toolProgressMode, process.env.BRIDGE_TOOL_PROGRESS_MODE, envFileVars.BRIDGE_TOOL_PROGRESS_MODE, DEFAULT_CONFIG.toolProgressMode),
     toolCallRetry: pick(args.toolCallRetry, envBool(process.env.BRIDGE_TOOL_CALL_RETRY), envBool(envFileVars.BRIDGE_TOOL_CALL_RETRY), DEFAULT_CONFIG.toolCallRetry),
     maxToolCallRetries: pick(args.maxToolCallRetries, envInt(process.env.BRIDGE_MAX_TOOL_CALL_RETRIES), envInt(envFileVars.BRIDGE_MAX_TOOL_CALL_RETRIES), DEFAULT_CONFIG.maxToolCallRetries),
     upstreamMaxRetries: pick(args.upstreamMaxRetries, envInt(process.env.BRIDGE_UPSTREAM_MAX_RETRIES), envInt(envFileVars.BRIDGE_UPSTREAM_MAX_RETRIES), DEFAULT_CONFIG.upstreamMaxRetries),
@@ -238,6 +242,10 @@ export function validateConfig(config) {
 
   if (config.upstreamConcurrency < 1) {
     throw new Error(`上游并发数无效: ${config.upstreamConcurrency}，应大于等于 1`);
+  }
+
+  if (!['preface', 'reasoning', 'silent'].includes(config.toolProgressMode)) {
+    throw new Error(`工具过程文字模式无效: ${config.toolProgressMode}，应为 preface、reasoning 或 silent`);
   }
 }
 

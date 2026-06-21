@@ -245,16 +245,20 @@ export function createStreamConverter(responseId, model, options = {}) {
   let finished = false;
   let outputIndex = 0;
   let textItemActive = false;
+  let textItemCompleted = false;
   let textContentIndex = 0;
   let sequenceNumber = 0;
   let accumulatedText = "";
+  let emittedMessageText = "";
   let pendingTextDeltas = [];
   let hasSeenToolCall = false;
   const deferMessageUntilFinish = options.deferMessageUntilFinish === true;
+  const toolProgressMode = options.toolProgressMode ?? "preface";
   const suppressStreamingAssistantMessage = deferMessageUntilFinish;
   const createdAt = options.createdAt ?? Math.floor(Date.now() / 1000);
   const responseSuffix = responseId.replace(/^resp_/, "");
   const messageItemId = `msg_${responseSuffix}`;
+  const reasoningItemId = `rs_${responseSuffix}`;
   const enableReasoning = options.enableReasoning === true;
   const textFilter = createReasoningFilter({ enabled: !enableReasoning });
 
@@ -294,6 +298,7 @@ export function createStreamConverter(responseId, model, options = {}) {
       part: { type: "output_text", text: "", annotations: [], logprobs: [] }
     }));
     for (const deltaText of pendingTextDeltas) {
+      emittedMessageText += deltaText;
       events.push(seq({
         type: "response.output_text.delta",
         output_index: outputIndex,
@@ -306,6 +311,91 @@ export function createStreamConverter(responseId, model, options = {}) {
     }
     pendingTextDeltas = [];
     textItemActive = true;
+  }
+
+  function completeActiveMessage(events, phase = null) {
+    if (!textItemActive || textItemCompleted) return;
+    events.push(seq({
+      type: "response.output_text.done",
+      output_index: outputIndex,
+      content_index: textContentIndex,
+      item_id: messageItemId,
+      text: emittedMessageText,
+      logprobs: []
+    }));
+    events.push(seq({
+      type: "response.content_part.done",
+      output_index: outputIndex,
+      content_index: textContentIndex,
+      item_id: messageItemId,
+      part: { type: "output_text", text: emittedMessageText, annotations: [], logprobs: [] }
+    }));
+    events.push(seq({
+      type: "response.output_item.done",
+      output_index: outputIndex,
+      item: {
+        type: "message",
+        id: messageItemId,
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: emittedMessageText, annotations: [], logprobs: [] }],
+        phase
+      }
+    }));
+    textItemCompleted = true;
+  }
+
+  function emitBufferedTextAsReasoning(events) {
+    if (accumulatedText.length === 0) return;
+    events.push(seq({
+      type: "response.output_item.added",
+      output_index: outputIndex,
+      item: {
+        type: "reasoning",
+        id: reasoningItemId,
+        summary: [],
+        status: "in_progress"
+      }
+    }));
+    events.push(seq({
+      type: "response.reasoning_summary_part.added",
+      output_index: outputIndex,
+      item_id: reasoningItemId,
+      summary_index: 0,
+      part: { type: "summary_text", text: "" }
+    }));
+    events.push(seq({
+      type: "response.reasoning_summary_text.delta",
+      output_index: outputIndex,
+      item_id: reasoningItemId,
+      summary_index: 0,
+      delta: accumulatedText,
+      obfuscation: makeObfuscation(sequenceNumber)
+    }));
+    events.push(seq({
+      type: "response.reasoning_summary_text.done",
+      output_index: outputIndex,
+      item_id: reasoningItemId,
+      summary_index: 0,
+      text: accumulatedText
+    }));
+    events.push(seq({
+      type: "response.reasoning_summary_part.done",
+      output_index: outputIndex,
+      item_id: reasoningItemId,
+      summary_index: 0,
+      part: { type: "summary_text", text: accumulatedText }
+    }));
+    events.push(seq({
+      type: "response.output_item.done",
+      output_index: outputIndex,
+      item: {
+        type: "reasoning",
+        id: reasoningItemId,
+        summary: [{ type: "summary_text", text: accumulatedText }],
+        status: "completed"
+      }
+    }));
   }
 
   function responseSnapshot(status, output = [], usage = undefined) {
@@ -369,7 +459,8 @@ export function createStreamConverter(responseId, model, options = {}) {
       textDelta = textFilter.push(textDelta);
       if (textDelta && textDelta.length > 0) {
         accumulatedText += textDelta;
-        if (textItemActive) {
+        if (textItemActive && !textItemCompleted && !(deferMessageUntilFinish && hasSeenToolCall)) {
+          emittedMessageText += textDelta;
           events.push(seq({
             type: "response.output_text.delta",
             output_index: outputIndex,
@@ -389,6 +480,10 @@ export function createStreamConverter(responseId, model, options = {}) {
 
       // 工具调用
       if (Array.isArray(delta?.tool_calls)) {
+        if (!hasSeenToolCall && delta.tool_calls.length > 0 && deferMessageUntilFinish && toolProgressMode === "preface" && pendingTextDeltas.length > 0) {
+          emitBufferedMessage(events);
+          completeActiveMessage(events, "tool_preface");
+        }
         hasSeenToolCall = hasSeenToolCall || delta.tool_calls.length > 0;
         for (const tc of delta.tool_calls) {
           const idx = tc.index ?? 0;
@@ -467,38 +562,16 @@ export function createStreamConverter(responseId, model, options = {}) {
         if (finished) return flush(events); // 已经发过 completed，跳过
         finished = true;
         const shouldEmitAssistantMessage = !hasSeenToolCall && accumulatedText.length > 0;
-        const shouldEmitAssistantStreamEvents = shouldEmitAssistantMessage && !suppressStreamingAssistantMessage;
+        const shouldEmitAssistantStreamEvents = shouldEmitAssistantMessage;
         if (shouldEmitAssistantStreamEvents) {
           emitBufferedMessage(events);
         }
         if (textItemActive && shouldEmitAssistantStreamEvents) {
-          events.push(seq({
-            type: "response.output_text.done",
-            output_index: outputIndex,
-            content_index: textContentIndex,
-            item_id: messageItemId,
-            text: accumulatedText,
-            logprobs: []
-          }));
-          events.push(seq({
-            type: "response.content_part.done",
-            output_index: outputIndex,
-            content_index: textContentIndex,
-            item_id: messageItemId,
-            part: { type: "output_text", text: accumulatedText, annotations: [], logprobs: [] }
-          }));
-          events.push(seq({
-            type: "response.output_item.done",
-            output_index: outputIndex,
-            item: {
-              type: "message",
-              id: messageItemId,
-              role: "assistant",
-              status: "completed",
-              content: [{ type: "output_text", text: accumulatedText, annotations: [], logprobs: [] }],
-              phase: toolCallStates.size === 0 ? "final_answer" : null
-            }
-          }));
+          completeActiveMessage(events, toolCallStates.size === 0 ? "final_answer" : null);
+        }
+
+        if (hasSeenToolCall && accumulatedText.length > 0 && toolProgressMode === "reasoning") {
+          emitBufferedTextAsReasoning(events);
         }
 
         for (const [idx, state] of toolCallStates) {
@@ -547,6 +620,14 @@ export function createStreamConverter(responseId, model, options = {}) {
         }
 
         const outputItems = [];
+        if (hasSeenToolCall && accumulatedText.length > 0 && toolProgressMode === "reasoning") {
+          outputItems.push({
+            type: "reasoning",
+            id: reasoningItemId,
+            summary: [{ type: "summary_text", text: accumulatedText }],
+            status: "completed"
+          });
+        }
         if (shouldEmitAssistantMessage) {
           outputItems.push({
             type: "message",

@@ -91,6 +91,24 @@ export function stripAssistantMessagesFromToolTurn(responseBody) {
   };
 }
 
+function shouldBufferAssistantStreamEvents(chatRequest, responsesRequest = {}, config = {}) {
+  if ((config.toolProgressMode ?? "preface") === "preface") return false;
+  if (Array.isArray(chatRequest.tools) && chatRequest.tools.length > 0) return true;
+  const input = Array.isArray(responsesRequest.input) ? responsesRequest.input : [];
+  return input.some((item) => item?.type === "function_call" || item?.type === "function_call_output" || item?.type === "custom_tool_call" || item?.type === "custom_tool_call_output");
+}
+
+function isAssistantTextStreamEvent(event) {
+  if (event?.type === "response.output_text.delta" || event?.type === "response.output_text.done") return true;
+  if (event?.type === "response.content_part.added" || event?.type === "response.content_part.done") {
+    return event.item_id?.startsWith("msg_") || event.part?.type === "output_text";
+  }
+  if (event?.type === "response.output_item.added" || event?.type === "response.output_item.done") {
+    return event.item?.type === "message";
+  }
+  return false;
+}
+
 // ── SSE 行缓冲解析器 ──────────────────────────────────────
 // 处理跨 chunk 的 data 行、空行分隔、注释行等边界情况
 
@@ -569,10 +587,12 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
   });
 
   const responseId = makeResponseId();
+  const shouldBufferAssistantEvents = shouldBufferAssistantStreamEvents(chatRequest, responsesRequest, config);
   const converter = createStreamConverter(responseId, chatRequest.model, {
     enableReasoning: config.enableReasoning,
     toolContext,
     deferMessageUntilFinish: Array.isArray(chatRequest.tools) && chatRequest.tools.length > 0,
+    toolProgressMode: config.toolProgressMode,
     instructions: responsesRequest.instructions ?? null,
     maxOutputTokens: responsesRequest.max_output_tokens ?? null,
     previousResponseId: responsesRequest.previous_response_id ?? null,
@@ -601,6 +621,7 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
   let lastUsage = null;
   let completedResponse = null;
   let streamCompleted = false; // 防止重复发 completed
+  const bufferedAssistantEvents = [];
 
   // 空闲超时 + 总超时
   let idleTimer = null;
@@ -639,17 +660,33 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
       // 已发过 completed 就不再发
       if (streamCompleted && event.type === "response.completed") continue;
 
-      safeSseWrite(response, event);
+      let outgoingEvent = event;
+
+      if (shouldBufferAssistantEvents && isAssistantTextStreamEvent(event)) {
+        bufferedAssistantEvents.push(event);
+        continue;
+      }
 
       if (event.type === "response.completed") {
-        completedResponse = event.response;
+        const hasToolOutputs = hasCodexToolOutputs(event.response?.output ?? []);
+        if (shouldBufferAssistantEvents && hasToolOutputs) {
+          outgoingEvent = {
+            ...event,
+            response: stripAssistantMessagesFromToolTurn(event.response)
+          };
+        } else if (shouldBufferAssistantEvents) {
+          for (const bufferedEvent of bufferedAssistantEvents) {
+            safeSseWrite(response, bufferedEvent);
+            recordStreamEvent(bufferedEvent);
+          }
+        }
+        bufferedAssistantEvents.length = 0;
+        completedResponse = outgoingEvent.response;
         streamCompleted = true;
       }
 
-      // 收集助手文本
-      if (event.type === "response.output_text.delta" && event.delta) {
-        assistantContent += event.delta;
-      }
+      safeSseWrite(response, outgoingEvent);
+      recordStreamEvent(outgoingEvent);
 
       // 收集工具调用
       if (event.type === "response.output_item.added" && (event.item?.type === "function_call" || event.item?.type === "custom_tool_call")) {
@@ -691,6 +728,12 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
       }
     }
   });
+
+  function recordStreamEvent(event) {
+    if (event.type === "response.output_text.delta" && event.delta) {
+      assistantContent += event.delta;
+    }
+  }
 
   try {
     while (!clientDisconnected) {

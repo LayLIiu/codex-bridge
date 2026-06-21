@@ -205,6 +205,154 @@ test("bridge 对非法 JSON 返回 OpenAI 风格错误", async (t) => {
   assert.equal(body.error.code, "invalid_json");
 });
 
+test("bridge 流式工具轮会丢弃上游混入的过程文本，避免提前触发 assistant message", async (t) => {
+  const upstream = http.createServer(async (request, response) => {
+    await readJson(request);
+    response.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache"
+    });
+    writeSse(response, {
+      id: "chatcmpl_stream_tool_preface",
+      model: "glm-5",
+      choices: [{ index: 0, delta: { content: "我先检查一下项目。" }, finish_reason: null }]
+    });
+    writeSse(response, {
+      id: "chatcmpl_stream_tool_preface",
+      model: "glm-5",
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: "call_stream_1",
+            type: "function",
+            function: { name: "shell", arguments: "{\"cmd\":\"pwd\"}" }
+          }]
+        },
+        finish_reason: null
+      }]
+    });
+    writeSse(response, {
+      id: "chatcmpl_stream_tool_preface",
+      model: "glm-5",
+      choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }]
+    });
+    response.end("data: [DONE]\n\n");
+  });
+
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const bridge = http.createServer((request, response) => {
+    handleRequest(request, response, {
+      chatCompletionsUrl: `${serverUrl(upstream)}/v1/chat/completions`,
+      upstreamApiKey: "test-key",
+      strictNativeTools: false
+    }).catch((error) => {
+      writeJson(response, 500, { error: error.message });
+    });
+  });
+
+  await listen(bridge);
+  t.after(() => bridge.close());
+
+  const response = await fetch(`${serverUrl(bridge)}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "codex-model-name",
+      stream: true,
+      input: [{ type: "message", role: "user", content: "看一下当前目录" }],
+      tools: [
+        {
+          type: "function",
+          name: "shell",
+          parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] }
+        }
+      ]
+    })
+  });
+
+  const events = parseSseEvents(await response.text());
+  const messageEvents = events.filter((event) => event.type === "response.output_item.added" && event.item?.type === "message");
+  const textDeltas = events.filter((event) => event.type === "response.output_text.delta");
+  const doneMessage = events.find((event) => event.type === "response.output_item.done" && event.item?.type === "message");
+  const completed = events.find((event) => event.type === "response.completed");
+
+  assert.equal(response.status, 200);
+  assert.equal(messageEvents.length, 1);
+  assert.equal(textDeltas.map((event) => event.delta).join(""), "我先检查一下项目。");
+  assert.equal(doneMessage.item.phase, "tool_preface");
+  assert.equal(completed.response.output.some((item) => item.type === "message"), false);
+  assert.equal(completed.response.output.some((item) => item.type === "reasoning"), false);
+  assert.equal(completed.response.output.find((item) => item.type === "function_call").name, "shell");
+});
+
+test("bridge 带工具列表的纯文本流式回复应在结束时发出 assistant message", async (t) => {
+  const upstream = http.createServer(async (request, response) => {
+    await readJson(request);
+    response.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache"
+    });
+    writeSse(response, {
+      id: "chatcmpl_stream_text_with_tools",
+      model: "glm-5",
+      choices: [{ index: 0, delta: { content: "你好！" }, finish_reason: null }]
+    });
+    writeSse(response, {
+      id: "chatcmpl_stream_text_with_tools",
+      model: "glm-5",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+    });
+    response.end("data: [DONE]\n\n");
+  });
+
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const bridge = http.createServer((request, response) => {
+    handleRequest(request, response, {
+      chatCompletionsUrl: `${serverUrl(upstream)}/v1/chat/completions`,
+      upstreamApiKey: "test-key",
+      strictNativeTools: false
+    }).catch((error) => {
+      writeJson(response, 500, { error: error.message });
+    });
+  });
+
+  await listen(bridge);
+  t.after(() => bridge.close());
+
+  const response = await fetch(`${serverUrl(bridge)}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "codex-model-name",
+      stream: true,
+      input: [{ type: "message", role: "user", content: "你好" }],
+      tools: [
+        {
+          type: "function",
+          name: "shell",
+          parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] }
+        }
+      ]
+    })
+  });
+
+  const events = parseSseEvents(await response.text());
+  const textDeltas = events.filter((event) => event.type === "response.output_text.delta");
+  const doneMessage = events.find((event) => event.type === "response.output_item.done" && event.item?.type === "message");
+  const completed = events.find((event) => event.type === "response.completed");
+
+  assert.equal(response.status, 200);
+  assert.equal(textDeltas.map((event) => event.delta).join(""), "你好！");
+  assert.equal(doneMessage.item.phase, "final_answer");
+  assert.equal(completed.response.output_text, "你好！");
+});
+
 test("bridge 修复模型用文本输出的 JSON 工具调用", async (t) => {
   const upstream = http.createServer(async (request, response) => {
     await readJson(request);
@@ -355,6 +503,25 @@ async function readJson(request) {
 function writeJson(response, statusCode, body) {
   response.writeHead(statusCode, { "content-type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body));
+}
+
+function writeSse(response, body) {
+  response.write(`data: ${JSON.stringify(body)}\n\n`);
+}
+
+function parseSseEvents(text) {
+  return text
+    .split(/\n\n+/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map((block) => {
+      const dataLine = block.split("\n").find((line) => line.startsWith("data:"));
+      if (!dataLine) return null;
+      const data = dataLine.slice(5).trim();
+      if (!data || data === "[DONE]") return null;
+      return JSON.parse(data);
+    })
+    .filter(Boolean);
 }
 
 test("bridge 自动重试畸形工具调用", async (t) => {
