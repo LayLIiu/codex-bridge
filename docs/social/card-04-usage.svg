@@ -1,30 +1,75 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1350" viewBox="0 0 1080 1350">
   <defs>
-    <style>
-      .bg{fill:#ffffff}.ink{fill:#111827}.muted{fill:#667085}.card{fill:#f8fafc;stroke:#d0d5dd;stroke-width:2}.dark{fill:#101828}.sans{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
-    </style>
+    <style>.s{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}.m{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}</style>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="50%" stop-color="#8B5CF6"/>
+      <stop offset="100%" stop-color="#10B981"/>
+    </linearGradient>
   </defs>
-  <rect class="bg" width="1080" height="1350"/>
-  <text x="80" y="135" class="sans muted" font-size="30" font-weight="700">怎么用</text>
-  <text x="80" y="225" class="sans ink" font-size="72" font-weight="850">三步接入</text>
-  <text x="80" y="292" class="sans muted" font-size="31">本地启动 Bridge，再把 Codex 指向它。</text>
 
-  <rect x="80" y="390" width="920" height="160" rx="28" class="card"/>
-  <text x="125" y="450" class="sans ink" font-size="36" font-weight="850">1. 克隆项目</text>
-  <text x="125" y="505" class="mono muted" font-size="27">git clone https://github.com/LayLIiu/codex-bridge.git</text>
+  <rect width="1080" height="1350" fill="#FAFBFF"/>
+  <rect width="1080" height="5" fill="url(#g)"/>
 
-  <rect x="80" y="610" width="920" height="230" rx="28" class="dark"/>
-  <text x="125" y="670" class="sans" fill="#fff" font-size="36" font-weight="850">2. 启动 Bridge</text>
-  <text x="125" y="728" class="mono" fill="#a7f3d0" font-size="24">UPSTREAM_BASE_URL=https://... \</text>
-  <text x="125" y="770" class="mono" fill="#a7f3d0" font-size="24">UPSTREAM_API_KEY=sk-xxx \</text>
-  <text x="125" y="812" class="mono" fill="#a7f3d0" font-size="24">npm start</text>
+  <text x="80" y="88" class="s" fill="#94A3B8" font-size="18" font-weight="700">GET STARTED</text>
 
-  <rect x="80" y="900" width="920" height="190" rx="28" class="card"/>
-  <text x="125" y="960" class="sans ink" font-size="36" font-weight="850">3. Codex Base URL 填这个</text>
-  <rect x="125" y="1000" width="700" height="58" rx="18" fill="#eef4ff"/>
-  <text x="156" y="1038" class="mono" fill="#2563eb" font-size="27">http://127.0.0.1:8787/v1</text>
+  <text x="80" y="195" class="s" fill="#0F172A" font-size="64" font-weight="900" letter-spacing="-2">怎么用</text>
+  <text x="80" y="260" class="s" fill="#475569" font-size="28">三步接入，本地启动</text>
 
-  <rect x="80" y="1160" width="920" height="92" rx="28" fill="#ecfdf3"/>
-  <text x="540" y="1217" class="sans" fill="#047857" font-size="32" text-anchor="middle" font-weight="850">项目已开源：github.com/LayLIiu/codex-bridge</text>
-  <text x="80" y="1305" class="sans muted" font-size="25">建议本地使用，不要直接暴露公网。</text>
+  <!-- Step 1 -->
+  <rect x="60" y="320" width="960" height="180" rx="18" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1.5"/>
+  <circle cx="132" cy="380" r="26" fill="#3B82F6"/>
+  <text x="132" y="390" class="s" fill="#FFFFFF" font-size="22" font-weight="800" text-anchor="middle">1</text>
+  <text x="180" y="375" class="s" fill="#0F172A" font-size="26" font-weight="800">克隆项目</text>
+  <text x="180" y="408" class="s" fill="#64748B" font-size="16">零依赖，只需 Node.js 18+</text>
+  <rect x="180" y="428" width="780" height="44" rx="10" fill="#F1F5F9"/>
+  <text x="200" y="458" class="m" fill="#475569" font-size="17">git clone https://github.com/LayLIiu/codex-bridge.git &amp;&amp; cd codex-bridge</text>
+
+  <!-- Step 2 -->
+  <rect x="60" y="530" width="960" height="280" rx="18" fill="#0F172A"/>
+  <circle cx="132" cy="590" r="26" fill="#8B5CF6"/>
+  <text x="132" y="600" class="s" fill="#FFFFFF" font-size="22" font-weight="800" text-anchor="middle">2</text>
+  <text x="180" y="585" class="s" fill="#F8FAFC" font-size="26" font-weight="800">启动 Bridge</text>
+  <text x="180" y="618" class="s" fill="#94A3B8" font-size="16">设置上游模型服务的地址和密钥</text>
+
+  <!-- 百度千帆示例 -->
+  <text x="180" y="662" class="s" fill="#64748B" font-size="13" font-weight="600">百度千帆</text>
+  <rect x="180" y="674" width="780" height="36" rx="8" fill="#1E293B"/>
+  <text x="196" y="698" class="m" fill="#A7F3D0" font-size="14">UPSTREAM_BASE_URL=https://qianfan.baidubce.com/v2/coding UPSTREAM_API_KEY=sk-xxx npm start</text>
+
+  <!-- 阿里云示例 -->
+  <text x="180" y="736" class="s" fill="#64748B" font-size="13" font-weight="600">阿里云 DashScope</text>
+  <rect x="180" y="748" width="780" height="36" rx="8" fill="#1E293B"/>
+  <text x="196" y="772" class="m" fill="#A7F3D0" font-size="14">UPSTREAM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1 UPSTREAM_API_KEY=sk-xxx npm start</text>
+
+  <!-- Step 3 -->
+  <rect x="60" y="840" width="960" height="200" rx="18" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1.5"/>
+  <circle cx="132" cy="900" r="26" fill="#10B981"/>
+  <text x="132" y="910" class="s" fill="#FFFFFF" font-size="22" font-weight="800" text-anchor="middle">3</text>
+  <text x="180" y="895" class="s" fill="#0F172A" font-size="26" font-weight="800">Codex 设置里改一行</text>
+  <text x="180" y="928" class="s" fill="#64748B" font-size="16">API Base URL 指向 Bridge 即可</text>
+
+  <rect x="180" y="954" width="780" height="56" rx="12" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
+  <text x="216" y="990" class="m" fill="#2563EB" font-size="24" font-weight="600">http://127.0.0.1:8787/v1</text>
+
+  <!-- 模型名和 Key 提示 -->
+  <text x="180" y="1018" class="s" fill="#94A3B8" font-size="14">模型名填你的上游模型名 · API Key 可填任意值（Bridge 用环境变量里的 Key 转发）</text>
+
+  <!-- 完成 -->
+  <rect x="60" y="1078" width="960" height="72" rx="14" fill="#ECFDF5" stroke="#A7F3D0" stroke-width="1.5"/>
+  <text x="540" y="1122" class="s" fill="#047857" font-size="24" font-weight="800" text-anchor="middle">✅ 打开 Codex Desktop 正常用就行</text>
+
+  <!-- 安全提示 -->
+  <rect x="60" y="1178" width="460" height="64" rx="12" fill="#FFF7ED" stroke="#FED7AA" stroke-width="1"/>
+  <text x="80" y="1218" class="s" fill="#C2410C" font-size="16" font-weight="600">⚠️ 建议本地使用，不要暴露公网</text>
+
+  <rect x="560" y="1178" width="460" height="64" rx="12" fill="#F5F3FF" stroke="#DDD6FE" stroke-width="1"/>
+  <text x="580" y="1218" class="s" fill="#7C3AED" font-size="16" font-weight="600">💡 支持 .env 文件，不用每次敲变量</text>
+
+  <!-- 项目地址 -->
+  <rect x="60" y="1268" width="960" height="48" rx="12" fill="#F1F5F9"/>
+  <text x="100" y="1298" class="m" fill="#3B82F6" font-size="17">github.com/LayLIiu/codex-bridge</text>
+  <text x="880" y="1298" class="s" fill="#94A3B8" font-size="15" text-anchor="end">MIT License</text>
+
+  <text x="540" y="1336" class="s" fill="#CBD5E1" font-size="14" text-anchor="middle">4 / 4</text>
 </svg>

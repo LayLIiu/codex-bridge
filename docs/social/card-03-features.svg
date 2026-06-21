@@ -1,51 +1,84 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1350" viewBox="0 0 1080 1350">
   <defs>
-    <style>
-      .bg{fill:#f8fafc}.ink{fill:#111827}.muted{fill:#667085}.card{fill:#fff;stroke:#d9dee8;stroke-width:2}.sans{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",Arial,sans-serif}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
-    </style>
+    <style>.s{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}.m{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}</style>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="50%" stop-color="#8B5CF6"/>
+      <stop offset="100%" stop-color="#10B981"/>
+    </linearGradient>
   </defs>
-  <rect class="bg" width="1080" height="1350"/>
-  <text x="80" y="135" class="sans muted" font-size="30" font-weight="700">它能干什么</text>
-  <text x="80" y="225" class="sans ink" font-size="74" font-weight="850">把国产模型接进</text>
-  <text x="80" y="307" class="sans ink" font-size="74" font-weight="850">Codex 工作流</text>
 
-  <g transform="translate(80 420)">
-    <rect width="420" height="180" rx="28" class="card"/>
-    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">流式响应</text>
-    <text x="38" y="112" class="sans muted" font-size="27">SSE 实时转换</text>
-    <text x="38" y="150" class="mono" fill="#2563eb" font-size="23">response.output_text.delta</text>
-  </g>
-  <g transform="translate(580 420)">
-    <rect width="420" height="180" rx="28" class="card"/>
-    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">工具调用</text>
-    <text x="38" y="112" class="sans muted" font-size="27">function tool 双向映射</text>
-    <text x="38" y="150" class="mono" fill="#059669" font-size="23">tool_calls → function_call</text>
-  </g>
-  <g transform="translate(80 655)">
-    <rect width="420" height="180" rx="28" class="card"/>
-    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">文件编辑</text>
-    <text x="38" y="112" class="sans muted" font-size="27">自动适配 apply_patch</text>
-    <text x="38" y="150" class="mono" fill="#ea580c" font-size="23">+1 / -2 diff 体验</text>
-  </g>
-  <g transform="translate(580 655)">
-    <rect width="420" height="180" rx="28" class="card"/>
-    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">过程反馈</text>
-    <text x="38" y="112" class="sans muted" font-size="27">工具前开场可见</text>
-    <text x="38" y="150" class="mono" fill="#7c3aed" font-size="23">toolProgressMode=preface</text>
-  </g>
-  <g transform="translate(80 890)">
-    <rect width="420" height="180" rx="28" class="card"/>
-    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">自动修复</text>
-    <text x="38" y="112" class="sans muted" font-size="27">文本 JSON / patch</text>
-    <text x="38" y="150" class="mono" fill="#0f766e" font-size="23">repairTextToolCalls</text>
-  </g>
-  <g transform="translate(580 890)">
-    <rect width="420" height="180" rx="28" class="card"/>
-    <text x="38" y="62" class="sans ink" font-size="38" font-weight="850">限流重试</text>
-    <text x="38" y="112" class="sans muted" font-size="27">429 / 5xx 退避</text>
-    <text x="38" y="150" class="mono" fill="#be123c" font-size="23">Retry-After aware</text>
-  </g>
+  <rect width="1080" height="1350" fill="#FAFBFF"/>
+  <rect width="1080" height="5" fill="url(#g)"/>
 
-  <rect x="80" y="1160" width="920" height="96" rx="30" fill="#111827"/>
-  <text x="540" y="1222" class="sans" fill="#fff" font-size="32" text-anchor="middle" font-weight="800">重点不是换模型，而是让工具调用闭环跑起来</text>
+  <text x="80" y="88" class="s" fill="#94A3B8" font-size="18" font-weight="700">FEATURES</text>
+
+  <text x="80" y="195" class="s" fill="#0F172A" font-size="64" font-weight="900" letter-spacing="-2">能干啥</text>
+  <text x="80" y="260" class="s" fill="#475569" font-size="28">把国产模型接进 Codex 工作流——不只是聊天</text>
+
+  <!-- Row 1 -->
+  <rect x="60" y="320" width="460" height="196" rx="18" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1.5"/>
+  <rect x="60" y="320" width="460" height="5" rx="0" fill="#3B82F6"/>
+  <text x="100" y="382" class="s" fill="#0F172A" font-size="30" font-weight="800">🔄 流式响应</text>
+  <text x="100" y="418" class="s" fill="#475569" font-size="20">SSE 事件实时转换</text>
+  <text x="100" y="452" class="s" fill="#475569" font-size="20">打字机效果不卡不闪</text>
+  <text x="100" y="490" class="m" fill="#3B82F6" font-size="14">output_text.delta ← delta.content</text>
+
+  <rect x="560" y="320" width="460" height="196" rx="18" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1.5"/>
+  <rect x="560" y="320" width="460" height="5" rx="0" fill="#10B981"/>
+  <text x="600" y="382" class="s" fill="#0F172A" font-size="30" font-weight="800">🔧 工具调用闭环</text>
+  <text x="600" y="418" class="s" fill="#475569" font-size="20">function tool 双向映射</text>
+  <text x="600" y="452" class="s" fill="#475569" font-size="20">call_id 自动补齐</text>
+  <text x="600" y="490" class="m" fill="#10B981" font-size="14">tool_calls ⇄ function_call</text>
+
+  <!-- Row 2 -->
+  <rect x="60" y="546" width="460" height="196" rx="18" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1.5"/>
+  <rect x="60" y="546" width="460" height="5" rx="0" fill="#F59E0B"/>
+  <text x="100" y="608" class="s" fill="#0F172A" font-size="30" font-weight="800">📝 文件编辑</text>
+  <text x="100" y="644" class="s" fill="#475569" font-size="20">apply_patch 自动适配</text>
+  <text x="100" y="678" class="s" fill="#475569" font-size="20">+1 / -2 diff 体验完整保留</text>
+  <text x="100" y="716" class="m" fill="#F59E0B" font-size="14">文本 patch → function_call 自动修复</text>
+
+  <rect x="560" y="546" width="460" height="196" rx="18" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1.5"/>
+  <rect x="560" y="546" width="460" height="5" rx="0" fill="#8B5CF6"/>
+  <text x="600" y="608" class="s" fill="#0F172A" font-size="30" font-weight="800">💬 过程反馈</text>
+  <text x="600" y="644" class="s" fill="#475569" font-size="20">"我先看看项目结构"可见</text>
+  <text x="600" y="678" class="s" fill="#475569" font-size="20">三种模式：preface / reasoning / silent</text>
+  <text x="600" y="716" class="m" fill="#8B5CF6" font-size="14">toolProgressMode=preface（推荐）</text>
+
+  <!-- Row 3 -->
+  <rect x="60" y="772" width="460" height="196" rx="18" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1.5"/>
+  <rect x="60" y="772" width="460" height="5" rx="0" fill="#EF4444"/>
+  <text x="100" y="834" class="s" fill="#0F172A" font-size="30" font-weight="800">🛡️ 畸形修复</text>
+  <text x="100" y="870" class="s" fill="#475569" font-size="20">模型把工具调用写成纯文本？</text>
+  <text x="100" y="904" class="s" fill="#475569" font-size="20">自动识别 JSON / patch 并修复</text>
+  <text x="100" y="942" class="m" fill="#EF4444" font-size="14">repairTextToolCalls + 自动重试</text>
+
+  <rect x="560" y="772" width="460" height="196" rx="18" fill="#FFFFFF" stroke="#E2E8F0" stroke-width="1.5"/>
+  <rect x="560" y="772" width="460" height="5" rx="0" fill="#06B6D4"/>
+  <text x="600" y="834" class="s" fill="#0F172A" font-size="30" font-weight="800">⚡ 限流重试</text>
+  <text x="600" y="870" class="s" fill="#475569" font-size="20">429 / 5xx 指数退避</text>
+  <text x="600" y="904" class="s" fill="#475569" font-size="20">尊重 Retry-After</text>
+  <text x="600" y="942" class="m" fill="#06B6D4" font-size="14">并发控制 + 可配置重试次数</text>
+
+  <!-- Row 4 额外功能 -->
+  <rect x="60" y="998" width="300" height="72" rx="14" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="100" y="1042" class="s" fill="#475569" font-size="18" font-weight="600">📋 Session 日志</text>
+
+  <rect x="390" y="998" width="300" height="72" rx="14" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="430" y="1042" class="s" fill="#475569" font-size="18" font-weight="600">🧠 推理模式转发</text>
+
+  <rect x="720" y="998" width="300" height="72" rx="14" fill="#F8FAFC" stroke="#E2E8F0" stroke-width="1"/>
+  <text x="760" y="1042" class="s" fill="#475569" font-size="18" font-weight="600">🔍 原生工具模拟</text>
+
+  <!-- 底部总结 -->
+  <rect x="60" y="1110" width="960" height="100" rx="18" fill="#0F172A"/>
+  <text x="540" y="1152" class="s" fill="#F8FAFC" font-size="22" font-weight="700" text-anchor="middle">重点不是换模型聊天</text>
+  <text x="540" y="1186" class="s" fill="#94A3B8" font-size="18" text-anchor="middle">而是让工具调用闭环跑起来——读文件、执行命令、改代码、带回结果</text>
+
+  <!-- 已验证服务商 -->
+  <text x="80" y="1272" class="s" fill="#94A3B8" font-size="14" font-weight="600">已验证兼容</text>
+  <text x="200" y="1272" class="m" fill="#64748B" font-size="13">百度千帆 · 阿里云 DashScope · DeepSeek · 智谱 GLM · 硅基流动 · Ollama</text>
+
+  <text x="540" y="1336" class="s" fill="#CBD5E1" font-size="14" text-anchor="middle">3 / 4</text>
 </svg>
