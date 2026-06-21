@@ -16,6 +16,10 @@ import {
 } from "../src/adapter.js";
 import {
   resolveChatCompletionsUrl } from "../src/server.js";
+import {
+  hasCodexToolOutputs,
+  stripAssistantMessagesFromToolTurn
+} from "../src/server.js";
 
 test("把 Responses function tools 映射为 Chat Completions tools", () => {
   const { chatRequest } = toChatCompletionsRequest({
@@ -522,8 +526,8 @@ test("createStreamConverter 把 Chat delta 转为 Responses SSE 事件", () => {
     id: "chatcmpl_1",
     choices: [{ index: 0, delta: { content: "当前目录" } }]
   });
-  assert.equal(events.length, 1);
-  assert.equal(events[0].type, "response.output_text.delta");
+  assert.ok(events.length >= 1);
+  assert.equal(events.at(-1).type, "response.output_text.delta");
 
   // 最后一个 chunk：结束
   events = converter.processChunk({
@@ -1031,4 +1035,207 @@ test("apply_patch_call history 转回 apply_patch 代理工具", () => {
   assert.ok(messages[0].tool_calls[0].function.name.includes("apply_patch"));
   assert.equal(messages[1].role, "tool");
   assert.equal(messages[1].content, "ok");
+});
+
+// ─── 稳定性修复测试 ──────────────────────────────────
+
+test("createStreamConverter 防止重复 finish_reason", () => {
+  const converter = createStreamConverter("resp_dup", "test-model");
+  // 第一个正常 chunk
+  converter.processChunk({
+    choices: [{ delta: { content: "hi" }, finish_reason: null }]
+  });
+  // 第一个 finish
+  const events2 = converter.processChunk({
+    choices: [{ delta: {}, finish_reason: "stop" }]
+  });
+  assert.ok(events2.some(e => e.type === "response.completed"));
+  // 重复 finish 应该被跳过
+  const events3 = converter.processChunk({
+    choices: [{ delta: {}, finish_reason: "stop" }]
+  });
+  assert.ok(!events3.some(e => e.type === "response.completed"));
+});
+
+test("createStreamConverter forceFinish 从外部强制结束", () => {
+  const converter = createStreamConverter("resp_force", "test-model");
+  // 发一些内容但不 finish
+  converter.processChunk({
+    choices: [{ delta: { content: "hello" }, finish_reason: null }]
+  });
+  assert.ok(!converter.isFinished());
+  // forceFinish 应该返回 completed 事件
+  const events = converter.forceFinish();
+  assert.ok(converter.isFinished());
+  assert.ok(events.some(e => e.type === "response.completed"));
+  // 再次 forceFinish 应该返回空数组
+  const events2 = converter.forceFinish();
+  assert.deepEqual(events2, []);
+});
+
+test("createStreamConverter 正常完成后 isFinished 返回 true", () => {
+  const converter = createStreamConverter("resp_norm", "test-model");
+  converter.processChunk({
+    choices: [{ delta: { content: "done" }, finish_reason: "stop" }]
+  });
+  assert.ok(converter.isFinished());
+});
+
+test("createStreamConverter 有工具调用时 message phase 为 null（不折叠工具过程）", () => {
+  const converter = createStreamConverter("resp_phase_tool", "glm-5", { deferMessageUntilFinish: true });
+  // 模型先说一句话再调工具
+  const e1 = converter.processChunk({
+    choices: [{ delta: { content: "让我看看" } }]
+  });
+  const e2 = converter.processChunk({
+    choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "shell", arguments: '{"cmd":"cat foo"}' } }] } }]
+  });
+  const e3 = converter.processChunk({
+    choices: [{ delta: {}, finish_reason: "tool_calls" }]
+  });
+  const all = [...e1, ...e2, ...e3];
+
+  // output_item.added 的 message phase 应该是 null（不是 final_answer）
+  const addedMsg = all.find(e => e.type === "response.output_item.added" && e.item?.type === "message");
+  assert.equal(addedMsg, undefined);
+
+  // output_item.done 的 message phase 应该是 null（因为存在工具调用）
+  const doneMsg = all.find(e => e.type === "response.output_item.done" && e.item?.type === "message");
+  assert.equal(doneMsg, undefined);
+
+  // response.completed 中 message 的 phase 也应该是 null
+  const completed = all.find(e => e.type === "response.completed");
+  const msgInOutput = completed?.response?.output?.find(o => o.type === "message");
+  assert.equal(msgInOutput, undefined);
+});
+
+test("createStreamConverter 纯文本回复时 message phase 为 final_answer", () => {
+  const converter = createStreamConverter("resp_phase_text", "glm-5");
+  const e1 = converter.processChunk({
+    choices: [{ delta: { content: "这是最终回答" } }]
+  });
+  const e2 = converter.processChunk({
+    choices: [{ delta: {}, finish_reason: "stop" }]
+  });
+  const all = [...e1, ...e2];
+
+  // output_item.added 的 message phase 应该是 null（流式时还不知道是不是最终）
+  const addedMsg = all.find(e => e.type === "response.output_item.added" && e.item?.type === "message");
+  assert.equal(addedMsg?.item?.phase, null);
+
+  // output_item.done 的 message phase 应该是 final_answer（纯文本回复）
+  const doneMsg = all.find(e => e.type === "response.output_item.done" && e.item?.type === "message");
+  assert.equal(doneMsg?.item?.phase, "final_answer");
+
+  // response.completed 中 message 的 phase 也应该是 final_answer
+  const completed = all.find(e => e.type === "response.completed");
+  const msgInOutput = completed?.response?.output?.find(o => o.type === "message");
+  assert.equal(msgInOutput?.phase, "final_answer");
+});
+
+test("createStreamConverter 工具轮先吐文本时不应提前完成 assistant message", () => {
+  const converter = createStreamConverter("resp_tool_preface", "glm-5", { deferMessageUntilFinish: true });
+  const e1 = converter.processChunk({
+    choices: [{ delta: { content: "我先看看项目结构。" } }]
+  });
+  const e2 = converter.processChunk({
+    choices: [{
+      delta: {
+        tool_calls: [{
+          index: 0,
+          id: "call_preface",
+          type: "function",
+          function: { name: "shell", arguments: "{\"cmd\":\"ls\"}" }
+        }]
+      }
+    }]
+  });
+  const e3 = converter.processChunk({
+    choices: [{ delta: {}, finish_reason: "tool_calls" }]
+  });
+  const all = [...e1, ...e2, ...e3];
+
+  assert.equal(all.find(e => e.type === "response.output_item.added" && e.item?.type === "message"), undefined);
+  assert.ok(all.some(e => e.type === "response.output_item.added" && e.item?.type === "function_call"));
+  assert.equal(all.find(e => e.type === "response.output_item.done" && e.item?.type === "message"), undefined);
+
+  const completed = all.find(e => e.type === "response.completed");
+  assert.equal(completed?.response?.output?.find(o => o.type === "message"), undefined);
+});
+
+test("createStreamConverter 带工具请求的纯文本 stop 不应在进行中提前创建 assistant message", () => {
+  const converter = createStreamConverter("resp_deferred_stop", "glm-5", { deferMessageUntilFinish: true });
+  const e1 = converter.processChunk({
+    choices: [{ delta: { content: "最终结果如下" } }]
+  });
+  const e2 = converter.processChunk({
+    choices: [{ delta: {}, finish_reason: "stop" }]
+  });
+  const all = [...e1, ...e2];
+
+  assert.equal(e1.find(e => e.type === "response.output_item.added" && e.item?.type === "message"), undefined);
+  assert.equal(all.find(e => e.type === "response.output_item.done" && e.item?.type === "message"), undefined);
+
+  const completed = all.find(e => e.type === "response.completed");
+  const msgInOutput = completed?.response?.output?.find(o => o.type === "message");
+  assert.equal(msgInOutput?.phase, "final_answer");
+  assert.equal(msgInOutput?.content?.[0]?.text, "最终结果如下");
+});
+
+test("工具轮响应应移除混入的 assistant message，避免提前触发最终回答", () => {
+  const response = stripAssistantMessagesFromToolTurn({
+    id: "resp_tool_turn",
+    output: [
+      {
+        type: "message",
+        id: "msg_tool_turn",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "我先检查一下。", annotations: [] }]
+      },
+      {
+        type: "function_call",
+        id: "fc_tool_turn",
+        call_id: "fc_tool_turn",
+        name: "exec_command",
+        arguments: "{\"cmd\":\"ls\"}",
+        status: "completed"
+      }
+    ],
+    output_text: "我先检查一下。"
+  });
+
+  assert.equal(hasCodexToolOutputs(response.output), true);
+  assert.deepEqual(response.output, [
+    {
+      type: "function_call",
+      id: "fc_tool_turn",
+      call_id: "fc_tool_turn",
+      name: "exec_command",
+      arguments: "{\"cmd\":\"ls\"}",
+      status: "completed"
+    }
+  ]);
+  assert.equal(response.output_text, "");
+});
+
+test("纯文本最终回答不应被 stripAssistantMessagesFromToolTurn 修改", () => {
+  const response = {
+    id: "resp_final_text",
+    output: [
+      {
+        type: "message",
+        id: "msg_final_text",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "已经完成修复。", annotations: [] }],
+        phase: "final_answer"
+      }
+    ],
+    output_text: "已经完成修复。"
+  };
+
+  const normalized = stripAssistantMessagesFromToolTurn(response);
+  assert.deepEqual(normalized, response);
+  assert.equal(hasCodexToolOutputs(normalized.output), false);
 });

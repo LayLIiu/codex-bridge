@@ -213,12 +213,25 @@ function normalizeResponseId(id) {
 }
 
 function normalizeUsage(usage) {
-  if (!usage) return undefined;
-  return {
-    input_tokens: usage.prompt_tokens ?? usage.input_tokens ?? 0,
-    output_tokens: usage.completion_tokens ?? usage.output_tokens ?? 0,
-    total_tokens: usage.total_tokens ?? 0
+  // 原生 Responses API 总是返回 usage 对象，即使值为 0
+  if (!usage) {
+    return { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+  }
+  const inputTokens = usage.prompt_tokens ?? usage.input_tokens ?? 0;
+  const outputTokens = usage.completion_tokens ?? usage.output_tokens ?? 0;
+  const result = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: usage.total_tokens ?? inputTokens + outputTokens
   };
+  // 透传上游的缓存 token 信息（对齐原生 Responses API 的 cached_input_tokens）
+  if (usage.prompt_tokens_details?.cached_tokens ?? usage.cached_input_tokens) {
+    result.input_tokens_details = { cached_tokens: usage.prompt_tokens_details?.cached_tokens ?? usage.cached_input_tokens };
+  }
+  if (usage.completion_tokens_details?.reasoning_tokens ?? usage.reasoning_output_tokens) {
+    result.output_tokens_details = { reasoning_tokens: usage.completion_tokens_details?.reasoning_tokens ?? usage.reasoning_output_tokens };
+  }
+  return result;
 }
 
 // ---- 流式转换：Chat Completions SSE delta → Responses API SSE 事件 ----
@@ -229,11 +242,16 @@ function normalizeUsage(usage) {
  */
 export function createStreamConverter(responseId, model, options = {}) {
   let started = false;
+  let finished = false;
   let outputIndex = 0;
   let textItemActive = false;
   let textContentIndex = 0;
   let sequenceNumber = 0;
   let accumulatedText = "";
+  let pendingTextDeltas = [];
+  let hasSeenToolCall = false;
+  const deferMessageUntilFinish = options.deferMessageUntilFinish === true;
+  const suppressStreamingAssistantMessage = deferMessageUntilFinish;
   const createdAt = options.createdAt ?? Math.floor(Date.now() / 1000);
   const responseSuffix = responseId.replace(/^resp_/, "");
   const messageItemId = `msg_${responseSuffix}`;
@@ -252,6 +270,42 @@ export function createStreamConverter(responseId, model, options = {}) {
   function seq(event) {
     event.sequence_number = sequenceNumber++;
     return event;
+  }
+
+  function emitBufferedMessage(events) {
+    if (textItemActive || pendingTextDeltas.length === 0) return;
+    events.push(seq({
+      type: "response.output_item.added",
+      output_index: outputIndex,
+      item: {
+        type: "message",
+        id: messageItemId,
+        role: "assistant",
+        status: "in_progress",
+        content: [],
+        phase: null
+      }
+    }));
+    events.push(seq({
+      type: "response.content_part.added",
+      output_index: outputIndex,
+      content_index: textContentIndex,
+      item_id: messageItemId,
+      part: { type: "output_text", text: "", annotations: [], logprobs: [] }
+    }));
+    for (const deltaText of pendingTextDeltas) {
+      events.push(seq({
+        type: "response.output_text.delta",
+        output_index: outputIndex,
+        content_index: textContentIndex,
+        item_id: messageItemId,
+        delta: deltaText,
+        logprobs: [],
+        obfuscation: makeObfuscation(sequenceNumber)
+      }));
+    }
+    pendingTextDeltas = [];
+    textItemActive = true;
   }
 
   function responseSnapshot(status, output = [], usage = undefined) {
@@ -295,13 +349,14 @@ export function createStreamConverter(responseId, model, options = {}) {
       const finishReason = choice?.finish_reason;
 
       if (!started) {
+        const initialSnapshot = responseSnapshot("in_progress", []);
         events.push(seq({
           type: "response.created",
-          response: responseSnapshot("in_progress", [])
+          response: initialSnapshot
         }));
         events.push(seq({
           type: "response.in_progress",
-          response: responseSnapshot("in_progress", [])
+          response: initialSnapshot
         }));
         started = true;
       }
@@ -312,43 +367,29 @@ export function createStreamConverter(responseId, model, options = {}) {
         : delta?.content;
 
       textDelta = textFilter.push(textDelta);
-      if (textDelta) {
+      if (textDelta && textDelta.length > 0) {
         accumulatedText += textDelta;
-        if (!textItemActive) {
+        if (textItemActive) {
           events.push(seq({
-              type: "response.output_item.added",
-              output_index: outputIndex,
-              item: {
-                type: "message",
-                id: messageItemId,
-                role: "assistant",
-                status: "in_progress",
-                content: [],
-                phase: "final_answer"
-              }
-            }));
-            events.push(seq({
-              type: "response.content_part.added",
-              output_index: outputIndex,
-              content_index: textContentIndex,
-              item_id: messageItemId,
-              part: { type: "output_text", text: "", annotations: [], logprobs: [] }
-            }));
-          textItemActive = true;
+            type: "response.output_text.delta",
+            output_index: outputIndex,
+            content_index: textContentIndex,
+            item_id: messageItemId,
+            delta: textDelta,
+            logprobs: [],
+            obfuscation: makeObfuscation(sequenceNumber)
+          }));
+        } else if (deferMessageUntilFinish || hasSeenToolCall) {
+          pendingTextDeltas.push(textDelta);
+        } else {
+          pendingTextDeltas.push(textDelta);
+          emitBufferedMessage(events);
         }
-        events.push(seq({
-          type: "response.output_text.delta",
-          output_index: outputIndex,
-          content_index: textContentIndex,
-          item_id: messageItemId,
-          delta: textDelta,
-          logprobs: [],
-          obfuscation: makeObfuscation(sequenceNumber)
-        }));
       }
 
       // 工具调用
       if (Array.isArray(delta?.tool_calls)) {
+        hasSeenToolCall = hasSeenToolCall || delta.tool_calls.length > 0;
         for (const tc of delta.tool_calls) {
           const idx = tc.index ?? 0;
 
@@ -423,7 +464,14 @@ export function createStreamConverter(responseId, model, options = {}) {
 
       // 结束
       if (finishReason) {
-        if (textItemActive) {
+        if (finished) return flush(events); // 已经发过 completed，跳过
+        finished = true;
+        const shouldEmitAssistantMessage = !hasSeenToolCall && accumulatedText.length > 0;
+        const shouldEmitAssistantStreamEvents = shouldEmitAssistantMessage && !suppressStreamingAssistantMessage;
+        if (shouldEmitAssistantStreamEvents) {
+          emitBufferedMessage(events);
+        }
+        if (textItemActive && shouldEmitAssistantStreamEvents) {
           events.push(seq({
             type: "response.output_text.done",
             output_index: outputIndex,
@@ -448,7 +496,7 @@ export function createStreamConverter(responseId, model, options = {}) {
               role: "assistant",
               status: "completed",
               content: [{ type: "output_text", text: accumulatedText, annotations: [], logprobs: [] }],
-              phase: "final_answer"
+              phase: toolCallStates.size === 0 ? "final_answer" : null
             }
           }));
         }
@@ -466,13 +514,13 @@ export function createStreamConverter(responseId, model, options = {}) {
           if (doneItem.type === "custom_tool_call" && doneItem.input) {
             // 拆成小 delta 逐 token 发出，模拟原生 Codex 流式 patch 输入
             const input = doneItem.input;
-            for (let i = 0; i < input.length; i += 12) {
+            for (let i = 0; i < input.length; i += 40) {
               events.push(seq({
                 type: "response.custom_tool_call_input.delta",
                 output_index: state.itemOutputIndex,
                 item_id: state.itemId,
                 call_id: state.callId,
-                delta: input.slice(i, i + 12),
+                delta: input.slice(i, i + 40),
                 obfuscation: makeObfuscation(sequenceNumber)
               }));
             }
@@ -498,14 +546,15 @@ export function createStreamConverter(responseId, model, options = {}) {
           }));
         }
 
-          const outputItems = [];
-        if (accumulatedText) {
+        const outputItems = [];
+        if (shouldEmitAssistantMessage) {
           outputItems.push({
             type: "message",
             id: messageItemId,
             role: "assistant",
             status: "completed",
-            content: [{ type: "output_text", text: accumulatedText, annotations: [] }]
+            content: [{ type: "output_text", text: accumulatedText, annotations: [] }],
+            phase: toolCallStates.size === 0 ? "final_answer" : null
           });
         }
         for (const [idx, state] of toolCallStates) {
@@ -519,16 +568,28 @@ export function createStreamConverter(responseId, model, options = {}) {
           }, toolContext));
         }
 
+        const completedSnapshot = {
+          ...responseSnapshot("completed", outputItems, normalizeUsage(chunk?.usage)),
+          output_text: getOutputText(outputItems)
+        };
         events.push(seq({
           type: "response.completed",
-          response: {
-            ...responseSnapshot("completed", outputItems, normalizeUsage(chunk?.usage)),
-            output_text: getOutputText(outputItems)
-          }
+          response: completedSnapshot
         }));
       }
 
       return flush(events);
+    },
+
+    /** 上游断连时强制发 completed，避免客户端挂死 */
+    forceFinish() {
+      if (finished) return [];
+      return this.processChunk({ choices: [{ delta: {}, finish_reason: 'stop' }] });
+    },
+
+    /** 检查是否已发过 completed */
+    isFinished() {
+      return finished;
     }
   };
 }

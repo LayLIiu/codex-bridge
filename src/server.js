@@ -75,21 +75,108 @@ function summarizeRequestInputForLog(input) {
   });
 }
 
+export function hasCodexToolOutputs(output = []) {
+  return output.some((item) => item?.type === "function_call" || item?.type === "custom_tool_call");
+}
+
+export function stripAssistantMessagesFromToolTurn(responseBody) {
+  if (!responseBody || typeof responseBody !== "object") return responseBody;
+  if (!hasCodexToolOutputs(responseBody.output ?? [])) return responseBody;
+
+  const filteredOutput = (responseBody.output ?? []).filter((item) => item?.type !== "message");
+  return {
+    ...responseBody,
+    output: filteredOutput,
+    output_text: ""
+  };
+}
+
+// ── SSE 行缓冲解析器 ──────────────────────────────────────
+// 处理跨 chunk 的 data 行、空行分隔、注释行等边界情况
+
+function createSseLineParser(onData) {
+  let buffer = "";
+
+  return {
+    /** 将上游 chunk 喂入解析器 */
+    feed(chunkText) {
+      buffer += chunkText;
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      let dataAccum = null; // 当前 SSE 事件块内累积的 data 行
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+
+        // 空行 = SSE 事件块结束
+        if (trimmed === "") {
+          if (dataAccum !== null) {
+            onData(dataAccum);
+            dataAccum = null;
+          }
+          continue;
+        }
+
+        // SSE 注释行（冒号开头）忽略
+        if (trimmed.startsWith(":")) continue;
+
+        // event: 行暂时忽略，我们只关心 data
+        if (trimmed.startsWith("event:")) continue;
+
+        // data: 行
+        if (trimmed.startsWith("data:")) {
+          const payload = trimmed.slice(5).trim();
+          dataAccum = dataAccum === null ? payload : dataAccum + "\n" + payload;
+          continue;
+        }
+
+        // 其他行：可能是没有前缀的 data（某些上游不标准）
+        // 只有在当前块已有 data 时才忽略，否则尝试当 data
+        if (dataAccum === null && trimmed.length > 0) {
+          dataAccum = trimmed;
+        }
+      }
+    },
+
+    /** 流结束时 flush 残余 buffer */
+    flush() {
+      const remaining = buffer.trim();
+      if (remaining.startsWith("data:")) {
+        const payload = remaining.slice(5).trim();
+        if (payload && payload !== "[DONE]") {
+          onData(payload);
+        }
+      } else if (remaining && remaining !== "[DONE]") {
+        // 可能是没 data: 前缀的残行
+        onData(remaining);
+      }
+      buffer = "";
+    }
+  };
+}
+
 /**
  * 带重试的 fetch：对 5xx、429 和网络错误做退避重试。
+ * 支持 AbortSignal 超时。
  */
 async function fetchWithRetry(url, options, config = {}) {
   const maxRetries = config.upstreamMaxRetries ?? 1;
   const concurrency = config.upstreamConcurrency ?? 2;
   const baseDelayMs = config.upstreamRetryBaseDelayMs ?? 1000;
   const maxDelayMs = config.upstreamMaxRetryDelayMs ?? 15000;
+  const timeoutMs = config.upstreamTimeoutMs ?? 60_000;
   let lastError = null;
 
   const releaseSlot = await acquireUpstreamSlot(concurrency);
   try {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
       try {
-        const resp = await fetch(url, options);
+        const resp = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(timeoutId);
         // 5xx 或 429（限流）时重试
         if ((resp.status >= 500 || resp.status === 429) && attempt < maxRetries) {
           const delayMs = getRetryDelayMs(resp, attempt, baseDelayMs, maxDelayMs);
@@ -99,10 +186,12 @@ async function fetchWithRetry(url, options, config = {}) {
         }
         return resp;
       } catch (err) {
+        clearTimeout(timeoutId);
         lastError = err;
+        const isAbort = err.name === "AbortError";
         if (attempt < maxRetries) {
-          const delayMs = Math.min(baseDelayMs * (attempt + 1), maxDelayMs);
-          stderr.write(`[bridge] 请求异常: ${err.message}，${delayMs}ms 后重试 (${attempt + 1}/${maxRetries})\n`);
+          const delayMs = isAbort ? 500 : Math.min(baseDelayMs * (attempt + 1), maxDelayMs);
+          stderr.write(`[bridge] 请求${isAbort ? '超时' : '异常'}: ${err.message}，${delayMs}ms 后重试 (${attempt + 1}/${maxRetries})\n`);
           await sleep(delayMs);
         }
       }
@@ -119,9 +208,11 @@ async function main() {
 
   const server = http.createServer((request, response) => {
     handleRequest(request, response, config).catch((error) => {
-      writeJson(response, error.statusCode ?? 500, {
-        error: { message: error.message, type: error.type ?? "bridge_error" }
-      });
+      try {
+        writeJson(response, error.statusCode ?? 500, {
+          error: { message: error.message, type: error.type ?? "bridge_error" }
+        });
+      } catch {}
     });
   });
 
@@ -229,14 +320,12 @@ export async function handleRequest(request, response, config) {
   if (existingSession) {
     sessionId = existingSession.sessionId;
   } else {
-    // 提取工具列表给 session_meta
     const tools = (responsesRequest.tools ?? []).map(t => ({
       name: t.name ?? t.function?.name ?? '',
       description: t.description ?? t.function?.description ?? '',
       deferLoading: false,
     }));
 
-    // 提取 system prompt
     const systemMsg = chatRequest.messages?.find(m => m.role === 'system' || m.role === 'developer');
     const systemPrompt = typeof systemMsg?.content === 'string' ? systemMsg.content : '';
 
@@ -261,13 +350,10 @@ export async function handleRequest(request, response, config) {
 
   writeTaskStarted(sessionId, turnId);
 
-  // 新 session 写入 developer 消息（system prompt / instructions）
   if (isNewSession) {
-    // 优先使用 Responses API 的 instructions 字段
     if (responsesRequest.instructions && typeof responsesRequest.instructions === 'string') {
       writeDeveloperMessage(sessionId, responsesRequest.instructions);
     } else {
-      // 从 messages 里找 system/developer 消息
       const systemMsg = chatRequest.messages?.find(m => m.role === 'system' || m.role === 'developer');
       if (systemMsg?.content) {
         writeDeveloperMessage(sessionId, systemMsg.content);
@@ -275,7 +361,6 @@ export async function handleRequest(request, response, config) {
     }
   }
 
-  // 写入用户消息（response_item + event_msg）
   const lastUserMsg = chatRequest.messages?.findLast(m => m.role === 'user');
   if (lastUserMsg?.content) {
     const userText = typeof lastUserMsg.content === 'string' ? lastUserMsg.content : lastUserMsg.content;
@@ -283,7 +368,6 @@ export async function handleRequest(request, response, config) {
     writeUserMessageEvent(sessionId, typeof userText === 'string' ? userText : JSON.stringify(userText));
   }
 
-  // 写入 input 中的 function_call 和 function_call_output
   for (const item of inputItems) {
     if (!item || typeof item !== 'object') continue;
     if (item.type === 'function_call' && item.call_id) {
@@ -342,11 +426,9 @@ export async function handleRequest(request, response, config) {
     const issues = validateToolCalls(responsesBody.output ?? [], toolNames);
     if (issues.length === 0) break;
 
-    stderr.write(`[bridge] 工具调用验证发现 ${issues.length} 个问题，发起第 ${retryCount + 1} 次重试
-`);
+    stderr.write(`[bridge] 工具调用验证发现 ${issues.length} 个问题，发起第 ${retryCount + 1} 次重试\n`);
     for (const issue of issues) {
-      stderr.write(`  - ${issue.name}: ${issue.description}
-`);
+      stderr.write(`  - ${issue.name}: ${issue.description}\n`);
     }
 
     const retryMessages = buildRetryMessages(chatRequest.messages, responsesBody.output, issues);
@@ -375,28 +457,28 @@ export async function handleRequest(request, response, config) {
         responsesBody.bridge_warnings.push(`工具调用重试第 ${retryCount + 1} 次成功`);
         retryOk = true;
       } else {
-        stderr.write(`[bridge] 重试请求失败: ${retryResp.status}
-`);
+        stderr.write(`[bridge] 重试请求失败: ${retryResp.status}\n`);
       }
     } catch (err) {
-      stderr.write(`[bridge] 重试请求异常: ${err.message}
-`);
+      stderr.write(`[bridge] 重试请求异常: ${err.message}\n`);
     }
 
     retryCount++;
     if (retryOk) break;
   }
 
+  responsesBody = stripAssistantMessagesFromToolTurn(responsesBody);
+
   // 写入 assistant 响应
   const assistantOutput = responsesBody.output?.find(o => o.type === 'message');
   const lastAgentText = assistantOutput?.content?.[0]?.text ?? '';
+  const hasToolOutputs = hasCodexToolOutputs(responsesBody.output ?? []);
 
-  if (lastAgentText) {
+  if (lastAgentText && !hasToolOutputs) {
     writeAgentMessageEvent(sessionId, lastAgentText);
     writeAssistantResponse(sessionId, lastAgentText);
   }
 
-  // 写入 function_call
   for (const item of (responsesBody.output ?? [])) {
     if (item.type === 'function_call' || item.type === 'custom_tool_call') {
       writeFunctionCall(sessionId, item.call_id, item.name, item.arguments ?? item.input ?? '');
@@ -409,20 +491,15 @@ export async function handleRequest(request, response, config) {
     }
   }
 
-  // token 统计（对齐 Codex Desktop info 结构）
   const usage = responsesBody.usage;
   if (usage) {
     writeTokenCount(sessionId, usage.input_tokens ?? 0, usage.output_tokens ?? 0);
   }
 
-  // task_complete
-  writeTaskComplete(sessionId, turnId, lastAgentText);
-
-  // 注册 response ID
+  writeTaskComplete(sessionId, turnId, hasToolOutputs ? '' : lastAgentText);
   registerResponseId(responsesBody.id, sessionId);
   rememberResponse(responsesBody);
 
-  // 记录调试信息
   lastDebugEntry = {
     timestamp: new Date().toISOString(),
     request: {
@@ -434,7 +511,6 @@ export async function handleRequest(request, response, config) {
     retries: retryCount > 0 ? retryCount : undefined
   };
 
-  // 文件日志：记录完整响应
   fileLog({
     event: "response_outgoing",
     responseId: responsesBody.id,
@@ -451,9 +527,19 @@ export async function handleRequest(request, response, config) {
   writeJson(response, 200, responsesBody);
 }
 
+// ── 流式请求处理 ──────────────────────────────────────────
+
+const STREAM_IDLE_TIMEOUT_MS = 120_000; // 2 分钟无数据则断开
+const STREAM_TOTAL_TIMEOUT_MS = 600_000; // 10 分钟总超时
+
 async function handleStreamRequest(request, response, config, chatRequest, warnings, sessionId, turnId, toolContext, responsesRequest = {}) {
   chatRequest.stream = true;
   chatRequest.stream_options = { include_usage: true };
+
+  // 监听客户端断连，及时取消上游读取
+  let clientDisconnected = false;
+  const onClose = () => { clientDisconnected = true; };
+  request.on("close", onClose);
 
   let upstreamResponse;
   try {
@@ -463,11 +549,13 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
       body: JSON.stringify(chatRequest)
     }, config);
   } catch (err) {
+    request.off("close", onClose);
     writeTaskComplete(sessionId, turnId, '');
     return writeJson(response, 502, makeUpstreamError(`上游不可达: ${err.message}`, 502, null));
   }
 
   if (!upstreamResponse.ok) {
+    request.off("close", onClose);
     const bodyText = await upstreamResponse.text();
     writeTaskComplete(sessionId, turnId, '');
     return writeJson(response, upstreamResponse.status, makeUpstreamError("上游 Chat Completions 流式请求失败", upstreamResponse.status, parseJsonOrRaw(bodyText), upstreamResponse));
@@ -484,6 +572,7 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
   const converter = createStreamConverter(responseId, chatRequest.model, {
     enableReasoning: config.enableReasoning,
     toolContext,
+    deferMessageUntilFinish: Array.isArray(chatRequest.tools) && chatRequest.tools.length > 0,
     instructions: responsesRequest.instructions ?? null,
     maxOutputTokens: responsesRequest.max_output_tokens ?? null,
     previousResponseId: responsesRequest.previous_response_id ?? null,
@@ -499,106 +588,156 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
 
   if (warnings.length > 0) {
     for (const w of warnings) {
-      response.write(`data: ${JSON.stringify({ type: "bridge.warning", warning: w })}\n\n`);
+      safeSseWrite(response, { type: "bridge.warning", warning: w });
     }
   }
 
   const reader = upstreamResponse.body.getReader();
   const decoder = new TextDecoder();
-  let buffer = "";
 
   // 收集流式内容
   let assistantContent = "";
   const toolCallMap = new Map();
-  let lastUsage = null; // 收集最后一个 chunk 的 usage
+  let lastUsage = null;
   let completedResponse = null;
+  let streamCompleted = false; // 防止重复发 completed
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+  // 空闲超时 + 总超时
+  let idleTimer = null;
+  const streamStart = Date.now();
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
+  function resetIdleTimer() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      stderr.write('[bridge] 上游流式空闲超时，主动断开\n');
+      try { reader.cancel(); } catch {}
+    }, STREAM_IDLE_TIMEOUT_MS);
+  }
+  resetIdleTimer();
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data:")) continue;
+  // SSE 行解析器：处理跨 chunk 断行
+  const sseParser = createSseLineParser((data) => {
+    if (data === "[DONE]") return;
 
-        const data = trimmed.slice(5).trim();
-        if (data === "[DONE]") continue;
+    let chunk;
+    try {
+      chunk = JSON.parse(data);
+    } catch {
+      // 上游偶尔返回不完整 JSON，跳过这个 chunk 不中断整个流
+      stderr.write(`[bridge] 跳过无法解析的 SSE data: ${data.slice(0, 200)}\n`);
+      return;
+    }
 
-        let chunk;
-        try { chunk = JSON.parse(data); } catch { continue; }
+    if (chunk?.usage) {
+      lastUsage = chunk.usage;
+    }
 
-        // 收集 usage
-        if (chunk?.usage) {
-          lastUsage = chunk.usage;
+    if (clientDisconnected) return;
+
+    const events = converter.processChunk(chunk);
+    for (const event of events) {
+      // 已发过 completed 就不再发
+      if (streamCompleted && event.type === "response.completed") continue;
+
+      safeSseWrite(response, event);
+
+      if (event.type === "response.completed") {
+        completedResponse = event.response;
+        streamCompleted = true;
+      }
+
+      // 收集助手文本
+      if (event.type === "response.output_text.delta" && event.delta) {
+        assistantContent += event.delta;
+      }
+
+      // 收集工具调用
+      if (event.type === "response.output_item.added" && (event.item?.type === "function_call" || event.item?.type === "custom_tool_call")) {
+        const callId = event.item.call_id ?? event.item.id;
+        toolCallMap.set(callId, { id: callId, name: event.item.name ?? "", arguments: "", type: event.item.type });
+        writeEvent(sessionId, 'tool_call_started', {
+          turn_id: turnId,
+          call_id: callId,
+          name: event.item.name ?? ''
+        });
+      }
+
+      if (event.type === "response.function_call_arguments.delta" || event.type === "response.custom_tool_call_input.delta") {
+        const callId = event.call_id ?? event.item?.call_id;
+        if (callId && toolCallMap.has(callId)) {
+          toolCallMap.get(callId).arguments += event.delta ?? event.arguments ?? "";
+        } else if (callId) {
+          toolCallMap.set(callId, { id: callId, name: "", arguments: event.delta ?? event.arguments ?? "" });
         }
+      }
 
-        const events = converter.processChunk(chunk);
-        for (const event of events) {
-          stderr.write(`[bridge] event: ${event.type}\n`);
-          response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
-
-          // 收集助手文本
-          if (event.type === "response.output_text.delta" && event.delta) {
-            assistantContent += event.delta;
+      if (event.type === "response.output_item.done" && (event.item?.type === "function_call" || event.item?.type === "custom_tool_call")) {
+        const callId = event.item.call_id ?? event.item.id;
+        if (callId && toolCallMap.has(callId)) {
+          const tc = toolCallMap.get(callId);
+          if (!tc.name && event.item.name) tc.name = event.item.name;
+          if (event.item.arguments && tc.arguments !== event.item.arguments) {
+            tc.arguments = event.item.arguments;
+          } else if (event.item.input && tc.arguments !== event.item.input) {
+            tc.arguments = event.item.input;
           }
-
-          // 收集工具调用 — 从 output_item.added 拿 id 和 name
-          if (event.type === "response.output_item.added" && (event.item?.type === "function_call" || event.item?.type === "custom_tool_call")) {
-            const callId = event.item.call_id ?? event.item.id;
-            toolCallMap.set(callId, { id: callId, name: event.item.name ?? "", arguments: "", type: event.item.type });
-            writeEvent(sessionId, 'tool_call_started', {
-              turn_id: turnId,
-              call_id: callId,
-              name: event.item.name ?? ''
-            });
-          }
-
-          // 工具调用参数 delta
-          if (event.type === "response.function_call_arguments.delta" || event.type === "response.custom_tool_call_input.delta") {
-            const callId = event.call_id ?? event.item?.call_id;
-            if (callId && toolCallMap.has(callId)) {
-              toolCallMap.get(callId).arguments += event.delta ?? event.arguments ?? "";
-            } else if (callId) {
-              toolCallMap.set(callId, { id: callId, name: "", arguments: event.delta ?? event.arguments ?? "" });
-            }
-          }
-
-          // 工具调用参数完成
-          if (event.type === "response.output_item.done" && (event.item?.type === "function_call" || event.item?.type === "custom_tool_call")) {
-            const callId = event.item.call_id ?? event.item.id;
-            if (callId && toolCallMap.has(callId)) {
-              const tc = toolCallMap.get(callId);
-              if (!tc.name && event.item.name) tc.name = event.item.name;
-              if (event.item.arguments && tc.arguments !== event.item.arguments) {
-                tc.arguments = event.item.arguments;
-              } else if (event.item.input && tc.arguments !== event.item.input) {
-                tc.arguments = event.item.input;
-              }
-              writeEvent(sessionId, 'tool_call_completed', {
-                turn_id: turnId,
-                call_id: callId,
-                name: tc.name,
-                arguments: tc.arguments
-              });
-            }
-          }
-
-          if (event.type === "response.completed") {
-            completedResponse = event.response;
-          }
+          writeEvent(sessionId, 'tool_call_completed', {
+            turn_id: turnId,
+            call_id: callId,
+            name: tc.name,
+            arguments: tc.arguments
+          });
         }
       }
     }
+  });
+
+  try {
+    while (!clientDisconnected) {
+      // 总超时检查
+      if (Date.now() - streamStart > STREAM_TOTAL_TIMEOUT_MS) {
+        stderr.write('[bridge] 流式总超时，主动断开\n');
+        break;
+      }
+
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      resetIdleTimer();
+      sseParser.feed(decoder.decode(value, { stream: true }));
+    }
   } catch (err) {
-    stderr.write(`流式转发异常：${err.message}\n`);
+    stderr.write(`[bridge] 流式转发异常：${err.message}\n`);
+    fileLog({ event: "stream_error", error: err.message, responseId });
   } finally {
-    // ── 写入 JSONL（对齐 Codex Desktop 格式）──
-    if (assistantContent) {
+    if (idleTimer) clearTimeout(idleTimer);
+    request.off("close", onClose);
+
+    // flush SSE 解析器残留数据
+    try { sseParser.flush(); } catch {}
+
+    // 兜底：如果上游断连但 converter 还没发 completed，用 forceFinish 补一个
+    if (!streamCompleted && !clientDisconnected) {
+      try {
+        const forcedEvents = converter.forceFinish();
+        for (const event of forcedEvents) {
+          if (event.type === "response.completed") {
+            // 标记为 incomplete 因为不是正常结束
+            event.response.status = "incomplete";
+            if (!event.response.error) {
+              event.response.error = { message: "上游连接中断", type: "upstream_stream_error" };
+            }
+          }
+          safeSseWrite(response, event);
+        }
+        completedResponse = forcedEvents.find(e => e.type === "response.completed")?.response;
+      } catch {}
+    }
+
+    // ── 写入 JSONL ──
+    const hasToolOutputs = toolCallMap.size > 0 || hasCodexToolOutputs(completedResponse?.output ?? []);
+
+    if (assistantContent && !hasToolOutputs) {
       writeAgentMessageEvent(sessionId, assistantContent);
       writeAssistantResponse(sessionId, assistantContent);
     }
@@ -607,11 +746,9 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
       writeFunctionCall(sessionId, tc.id, tc.name, tc.arguments);
     }
 
-    // token 统计（使用上游返回的 usage 或兜底估算）
     let inputTokens = lastUsage?.prompt_tokens ?? 0;
     let outputTokens = lastUsage?.completion_tokens ?? 0;
     if (!lastUsage && config.tokenEstimationEnabled !== false) {
-      // 兜底估算：基于文本和工具调用参数的字符数
       let outputEstimate = estimateTokens(assistantContent ?? "");
       for (const [, tc] of toolCallMap) {
         outputEstimate += estimateTokens(tc.arguments ?? "");
@@ -620,13 +757,11 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
       inputTokens = inputTokens || Math.round(outputTokens * 2.5);
     }
     writeTokenCount(sessionId, inputTokens, outputTokens);
+    writeTaskComplete(sessionId, turnId, hasToolOutputs ? '' : assistantContent);
 
-    // task_complete
-    writeTaskComplete(sessionId, turnId, assistantContent);
-
-    // 注册 response ID
     registerResponseId(responseId, sessionId);
     if (completedResponse) {
+      completedResponse = stripAssistantMessagesFromToolTurn(completedResponse);
       if (!completedResponse.usage) {
         if (lastUsage) {
           completedResponse.usage = normalizeChatUsage(lastUsage);
@@ -637,18 +772,27 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
       rememberResponse(completedResponse);
     }
 
-    // 文件日志：记录流式响应结果
     fileLog({
       event: "stream_response_done",
       responseId,
       toolCalls: Array.from(toolCallMap.values()).map(tc => ({
         id: tc.id, name: tc.name, type: tc.type, arguments: tc.arguments?.slice(0, 500)
       })),
-      assistantContent: assistantContent?.slice(0, 500)
+      assistantContent: assistantContent?.slice(0, 500),
+      completed: streamCompleted
     });
 
-    response.end();
+    try { response.end(); } catch {}
   }
+}
+
+// ── 安全写 SSE：客户端断连后不崩 ──────────────────────────
+
+function safeSseWrite(response, event) {
+  try {
+    const eventType = event.type ?? "message";
+    response.write(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`);
+  } catch {}
 }
 
 // ─── 辅助函数 ───────────────────────────────────────────────
@@ -720,7 +864,6 @@ async function readJsonBody(request) {
 
 function buildUpstreamHeaders(request, config) {
   const headers = { "content-type": "application/json" };
-  // 直接透传客户端的 Authorization，config 里的 key 仅作为兜底
   const authorization = request.headers.authorization || (config.upstreamApiKey ? `Bearer ${config.upstreamApiKey}` : null);
   if (authorization) headers.authorization = authorization;
   return headers;
