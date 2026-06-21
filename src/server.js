@@ -53,7 +53,7 @@ function fileLog(entry) {
 
 function clearLogFile() {
   try {
-    if (existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
+    if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
     writeFileSync(LOG_FILE, "");
   } catch {}
 }
@@ -110,24 +110,21 @@ function isAssistantTextStreamEvent(event) {
 }
 
 // ── SSE 行缓冲解析器 ──────────────────────────────────────
-// 处理跨 chunk 的 data 行、空行分隔、注释行等边界情况
 
 function createSseLineParser(onData) {
   let buffer = "";
 
   return {
-    /** 将上游 chunk 喂入解析器 */
     feed(chunkText) {
       buffer += chunkText;
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
 
-      let dataAccum = null; // 当前 SSE 事件块内累积的 data 行
+      let dataAccum = null;
 
       for (const line of lines) {
         const trimmed = line.trim();
 
-        // 空行 = SSE 事件块结束
         if (trimmed === "") {
           if (dataAccum !== null) {
             onData(dataAccum);
@@ -136,28 +133,21 @@ function createSseLineParser(onData) {
           continue;
         }
 
-        // SSE 注释行（冒号开头）忽略
         if (trimmed.startsWith(":")) continue;
-
-        // event: 行暂时忽略，我们只关心 data
         if (trimmed.startsWith("event:")) continue;
 
-        // data: 行
         if (trimmed.startsWith("data:")) {
           const payload = trimmed.slice(5).trim();
           dataAccum = dataAccum === null ? payload : dataAccum + "\n" + payload;
           continue;
         }
 
-        // 其他行：可能是没有前缀的 data（某些上游不标准）
-        // 只有在当前块已有 data 时才忽略，否则尝试当 data
         if (dataAccum === null && trimmed.length > 0) {
           dataAccum = trimmed;
         }
       }
     },
 
-    /** 流结束时 flush 残余 buffer */
     flush() {
       const remaining = buffer.trim();
       if (remaining.startsWith("data:")) {
@@ -166,7 +156,6 @@ function createSseLineParser(onData) {
           onData(payload);
         }
       } else if (remaining && remaining !== "[DONE]") {
-        // 可能是没 data: 前缀的残行
         onData(remaining);
       }
       buffer = "";
@@ -174,10 +163,6 @@ function createSseLineParser(onData) {
   };
 }
 
-/**
- * 带重试的 fetch：对 5xx、429 和网络错误做退避重试。
- * 支持 AbortSignal 超时。
- */
 async function fetchWithRetry(url, options, config = {}) {
   const maxRetries = config.upstreamMaxRetries ?? 1;
   const concurrency = config.upstreamConcurrency ?? 2;
@@ -195,7 +180,6 @@ async function fetchWithRetry(url, options, config = {}) {
       try {
         const resp = await fetch(url, { ...options, signal: controller.signal });
         clearTimeout(timeoutId);
-        // 5xx 或 429（限流）时重试
         if ((resp.status >= 500 || resp.status === 429) && attempt < maxRetries) {
           const delayMs = getRetryDelayMs(resp, attempt, baseDelayMs, maxDelayMs);
           stderr.write(`[bridge] 上游返回 ${resp.status}，${delayMs}ms 后重试 (${attempt + 1}/${maxRetries})\n`);
@@ -282,6 +266,11 @@ export async function handleRequest(request, response, config) {
     });
   }
 
+  // ── Chat Completions 透传（AiMaMi/CCWatch 测速用） ──
+  if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
+    return handleChatCompletionsPassthrough(request, response, config);
+  }
+
   const responseMatch = url.pathname.match(/^\/v1\/responses\/([^/]+)$/);
   if (responseMatch && request.method === "GET") {
     const stored = responseStore.get(responseMatch[1]);
@@ -301,7 +290,7 @@ export async function handleRequest(request, response, config) {
   }
 
   if (request.method !== "POST" || url.pathname !== "/v1/responses") {
-    return writeJson(response, 404, makeError("只支持 POST /v1/responses", "not_found_error"));
+    return writeJson(response, 404, makeError("只支持 POST /v1/responses 和 POST /v1/chat/completions", "not_found_error"));
   }
 
   let responsesRequest;
@@ -401,7 +390,7 @@ export async function handleRequest(request, response, config) {
     return handleStreamRequest(request, response, config, chatRequest, warnings, sessionId, turnId, toolContext, responsesRequest);
   }
 
-  // 非流式（带连接重试）
+  // 非流式
   let upstreamResponse;
   try {
     upstreamResponse = await fetchWithRetry(config.chatCompletionsUrl, {
@@ -487,7 +476,6 @@ export async function handleRequest(request, response, config) {
 
   responsesBody = stripAssistantMessagesFromToolTurn(responsesBody);
 
-  // 写入 assistant 响应
   const assistantOutput = responsesBody.output?.find(o => o.type === 'message');
   const lastAgentText = assistantOutput?.content?.[0]?.text ?? '';
   const hasToolOutputs = hasCodexToolOutputs(responsesBody.output ?? []);
@@ -545,16 +533,61 @@ export async function handleRequest(request, response, config) {
   writeJson(response, 200, responsesBody);
 }
 
+// ── Chat Completions 透传（AiMaMi/CCWatch 测速用） ──
+async function handleChatCompletionsPassthrough(request, response, config) {
+  try {
+    const body = await readJsonBody(request);
+    fileLog({ event: "chat_completions_passthrough", model: body.model, stream: body.stream ?? false });
+
+    const upstream = await fetchWithRetry(config.chatCompletionsUrl, {
+      method: "POST",
+      headers: buildUpstreamHeaders(request, config),
+      body: JSON.stringify(body)
+    }, config);
+
+    if (!upstream.ok) {
+      const errText = await upstream.text();
+      return writeJson(response, upstream.status, parseJsonOrRaw(errText));
+    }
+
+    if (body.stream) {
+      // 流式透传
+      response.writeHead(200, {
+        ...commonHeaders(),
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive"
+      });
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          response.write(decoder.decode(value, { stream: true }));
+        }
+      } catch {}
+      try { response.end(); } catch {}
+    } else {
+      // 非流式透传
+      const text = await upstream.text();
+      response.writeHead(200, { ...commonHeaders(), "content-type": "application/json; charset=utf-8" });
+      response.end(text);
+    }
+  } catch (err) {
+    return writeJson(response, 502, makeUpstreamError(`透传失败: ${err.message}`, 502, null));
+  }
+}
+
 // ── 流式请求处理 ──────────────────────────────────────────
 
-const STREAM_IDLE_TIMEOUT_MS = 120_000; // 2 分钟无数据则断开
-const STREAM_TOTAL_TIMEOUT_MS = 600_000; // 10 分钟总超时
+const STREAM_IDLE_TIMEOUT_MS = 120_000;
+const STREAM_TOTAL_TIMEOUT_MS = 600_000;
 
 async function handleStreamRequest(request, response, config, chatRequest, warnings, sessionId, turnId, toolContext, responsesRequest = {}) {
   chatRequest.stream = true;
   chatRequest.stream_options = { include_usage: true };
 
-  // 监听客户端断连，及时取消上游读取
   let clientDisconnected = false;
   const onClose = () => { clientDisconnected = true; };
   request.on("close", onClose);
@@ -615,15 +648,13 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
   const reader = upstreamResponse.body.getReader();
   const decoder = new TextDecoder();
 
-  // 收集流式内容
   let assistantContent = "";
   const toolCallMap = new Map();
   let lastUsage = null;
   let completedResponse = null;
-  let streamCompleted = false; // 防止重复发 completed
+  let streamCompleted = false;
   const bufferedAssistantEvents = [];
 
-  // 空闲超时 + 总超时
   let idleTimer = null;
   const streamStart = Date.now();
 
@@ -636,7 +667,6 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
   }
   resetIdleTimer();
 
-  // SSE 行解析器：处理跨 chunk 断行
   const sseParser = createSseLineParser((data) => {
     if (data === "[DONE]") return;
 
@@ -644,7 +674,6 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
     try {
       chunk = JSON.parse(data);
     } catch {
-      // 上游偶尔返回不完整 JSON，跳过这个 chunk 不中断整个流
       stderr.write(`[bridge] 跳过无法解析的 SSE data: ${data.slice(0, 200)}\n`);
       return;
     }
@@ -657,7 +686,6 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
 
     const events = converter.processChunk(chunk);
     for (const event of events) {
-      // 已发过 completed 就不再发
       if (streamCompleted && event.type === "response.completed") continue;
 
       let outgoingEvent = event;
@@ -688,7 +716,6 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
       safeSseWrite(response, outgoingEvent);
       recordStreamEvent(outgoingEvent);
 
-      // 收集工具调用
       if (event.type === "response.output_item.added" && (event.item?.type === "function_call" || event.item?.type === "custom_tool_call")) {
         const callId = event.item.call_id ?? event.item.id;
         toolCallMap.set(callId, { id: callId, name: event.item.name ?? "", arguments: "", type: event.item.type });
@@ -737,7 +764,6 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
 
   try {
     while (!clientDisconnected) {
-      // 总超时检查
       if (Date.now() - streamStart > STREAM_TOTAL_TIMEOUT_MS) {
         stderr.write('[bridge] 流式总超时，主动断开\n');
         break;
@@ -756,16 +782,13 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
     if (idleTimer) clearTimeout(idleTimer);
     request.off("close", onClose);
 
-    // flush SSE 解析器残留数据
     try { sseParser.flush(); } catch {}
 
-    // 兜底：如果上游断连但 converter 还没发 completed，用 forceFinish 补一个
     if (!streamCompleted && !clientDisconnected) {
       try {
         const forcedEvents = converter.forceFinish();
         for (const event of forcedEvents) {
           if (event.type === "response.completed") {
-            // 标记为 incomplete 因为不是正常结束
             event.response.status = "incomplete";
             if (!event.response.error) {
               event.response.error = { message: "上游连接中断", type: "upstream_stream_error" };
@@ -777,7 +800,6 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
       } catch {}
     }
 
-    // ── 写入 JSONL ──
     const hasToolOutputs = toolCallMap.size > 0 || hasCodexToolOutputs(completedResponse?.output ?? []);
 
     if (assistantContent && !hasToolOutputs) {
@@ -829,7 +851,7 @@ async function handleStreamRequest(request, response, config, chatRequest, warni
   }
 }
 
-// ── 安全写 SSE：客户端断连后不崩 ──────────────────────────
+// ── 安全写 SSE ──
 
 function safeSseWrite(response, event) {
   try {
@@ -838,7 +860,7 @@ function safeSseWrite(response, event) {
   } catch {}
 }
 
-// ─── 辅助函数 ───────────────────────────────────────────────
+// ── 辅助函数 ──
 
 function makeUUID() {
   return crypto.randomUUID();
