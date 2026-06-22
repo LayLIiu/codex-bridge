@@ -31,14 +31,14 @@ const DEFAULT_CONFIG = {
   tokenEstimationEnabled: true,
   
   // 工具调用重试配置
-  toolCallRetry: true,
-  maxToolCallRetries: 1,
+  toolCallRetry: false,
+  maxToolCallRetries: 0,
 
   // 上游限流/连接韧性配置
   upstreamMaxRetries: 1,
   upstreamRetryBaseDelayMs: 1000,
   upstreamMaxRetryDelayMs: 15000,
-  upstreamConcurrency: 2
+  upstreamConcurrency: 8
 };
 
 /**

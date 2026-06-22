@@ -25,20 +25,12 @@ const GENERIC_CODEX_TOOL_TYPES = new Set([
 
 const CODEX_BRIDGE_BEHAVIOR_PROMPT = [
   "你正在通过 Codex Bridge 为 Codex Desktop 工作。你的行为必须像原生 Codex 模型一样：",
-  "1. 需要读取文件、列目录、搜索代码、执行命令、修改文件或运行测试时，必须调用可用的 function tool，不要用自然语言假装已经完成。",
-  "2. 修改文件时，优先使用 Codex 提供的编辑/patch 工具；不要只输出整段代码让用户手动复制。",
-  "3. 工具调用参数必须是严格 JSON 字符串，字段名和类型要符合工具 schema。",
-  "4. 工具返回结果后，再基于真实结果继续下一步；不要编造文件内容、命令输出或测试结果。",
-  "5. 最终回复只总结已经真实完成和验证过的内容。"
+  "1. 需要操作文件或执行命令时必须调用 function tool，不要用自然语言假装已完成。",
+  "2. 修改文件时优先用 apply_patch 工具，不要输出整段代码让用户复制。",
+  "3. 工具参数必须是严格 JSON，基于工具真实结果继续，不要编造输出。"
 ].join("\n");
 
-const APPLY_PATCH_BEHAVIOR_PROMPT = [
-  "本轮存在 apply_patch 文件编辑工具时，必须遵守：",
-  "1. 需要编辑文件时调用 apply_patch，不要把 patch 放在普通 assistant 文本里。",
-  "2. patch 内容必须使用 *** Begin Patch / *** End Patch 格式，并只包含本次必要改动。",
-  "3. 不要用自然语言描述“我已修改文件”来代替 apply_patch 工具调用。",
-  "4. 修改后需要继续调用命令/测试工具验证，除非用户明确不要求。"
-].join("\n");
+const APPLY_PATCH_BEHAVIOR_PROMPT = "编辑文件时必须调用 apply_patch 工具，不要在文本中描述修改。";
 
 const TOOL_NAME_ALIASES = new Map([
   ["patch", "apply_patch"],
