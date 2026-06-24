@@ -24,13 +24,14 @@ const GENERIC_CODEX_TOOL_TYPES = new Set([
 ]);
 
 const CODEX_BRIDGE_BEHAVIOR_PROMPT = [
-  "你正在通过 Codex Bridge 为 Codex Desktop 工作。你的行为必须像原生 Codex 模型一样：",
-  "1. 需要操作文件或执行命令时必须调用 function tool，不要用自然语言假装已完成。",
+  "你正在通过 Codex Bridge 为 Codex Desktop 工作。你的行为应该像原生 Codex 模型一样：",
+  "1. 需要操作文件或执行命令时，优先调用 function tool 而不是用自然语言描述。",
   "2. 修改文件时优先用 apply_patch 工具，不要输出整段代码让用户复制。",
-  "3. 工具参数必须是严格 JSON，基于工具真实结果继续，不要编造输出。"
+  "3. 调用工具前后可以用简短文字说明你在做什么，帮助用户理解操作意图。",
+  "4. 工具参数必须是严格 JSON，基于工具真实结果继续，不要编造输出。"
 ].join("\n");
 
-const APPLY_PATCH_BEHAVIOR_PROMPT = "编辑文件时必须调用 apply_patch 工具，不要在文本中描述修改。";
+const APPLY_PATCH_BEHAVIOR_PROMPT = "编辑文件时优先调用 apply_patch 工具，可以用简短文字说明修改意图。";
 
 const TOOL_NAME_ALIASES = new Map([
   ["patch", "apply_patch"],
@@ -1825,10 +1826,11 @@ function copyKnownGenerationOptions(source, target) {
 function cleanMixedOutputText(text) {
   if (typeof text !== "string" || text.length === 0) return "";
 
-  // 常见的"废话"模式：以这些开头的句子通常是填充
-  const fillerPatterns = [
-    /^(好的|我来|我来帮你|让我|我来执行|正在|我来查看|我来修改|我来运行|好的，|我来为你)/,
-    /^(I'll |Let me |I will |I am going to |Sure,? |OK,? )/i,
+  // 只删极短的纯客套句，保留有实质信息的过程说明
+  // 之前正则太宽，把"我来查看项目结构"这类有信息的话也删了
+  const pureFillerPatterns = [
+    /^(好的[，。!]?|OK,?|Sure,?|好的，|没问题[，。]?)$/,
+    /^(I'll do that\.?|Got it\.?|On it\.?)$/i,
   ];
 
   const lines = text.split("\n");
@@ -1838,18 +1840,17 @@ function cleanMixedOutputText(text) {
     const trimmed = line.trim();
     if (!trimmed) continue;
 
-    const isFiller = fillerPatterns.some(p => p.test(trimmed));
+    const isFiller = pureFillerPatterns.some(p => p.test(trimmed));
     if (!isFiller) {
       kept.push(line);
     }
   }
 
-  // 如果全是废话，返回空字符串（不输出 message，只保留工具调用）
+  // 如果全是纯客套，返回空字符串
   if (kept.length === 0) return "";
 
   return kept.join("\n").trim();
 }
-
 // ─── 工具调用验证与重试 ──────────────────────────────────────
 
 /**

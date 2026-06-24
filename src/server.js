@@ -83,12 +83,45 @@ export function stripAssistantMessagesFromToolTurn(responseBody) {
   if (!responseBody || typeof responseBody !== "object") return responseBody;
   if (!hasCodexToolOutputs(responseBody.output ?? [])) return responseBody;
 
-  const filteredOutput = (responseBody.output ?? []).filter((item) => item?.type !== "message");
+  // 只删纯废话的 assistant message，保留有实质内容的过程说明
+  const filteredOutput = (responseBody.output ?? []).map((item) => {
+    if (item?.type !== "message") return item;
+    const text = extractMessageText(item);
+    if (!text || isPureFiller(text)) return null;
+    return item;
+  }).filter(Boolean);
+
+  const remainingText = filteredOutput
+    .filter(item => item?.type === "message")
+    .map(item => extractMessageText(item))
+    .join("");
+
   return {
     ...responseBody,
     output: filteredOutput,
-    output_text: ""
+    output_text: remainingText
   };
+}
+
+/** 提取 message item 的文本内容 */
+function extractMessageText(item) {
+  if (!item?.content) return "";
+  if (typeof item.content === "string") return item.content;
+  return item.content
+    .filter(p => p.type === "output_text" || p.type === "text")
+    .map(p => p.text ?? "")
+    .join("");
+}
+
+// 极短的纯废话才删——只有一句客套话且长度很短的情况
+function isPureFiller(text) {
+  if (typeof text !== "string" || text.length === 0) return true;
+  const trimmed = text.trim();
+  // 超过 60 个字符大概率有实质内容
+  if (trimmed.length > 60) return false;
+  // 极短客套："好的" "我来帮你" 等
+  const pureFiller = /^(好的[，。!]?|我来帮你[，。]?|好的，我来|让我来|正在处理[…。]?|OK,?|Sure,?|I'll do that\.?)$/i;
+  return pureFiller.test(trimmed);
 }
 
 function shouldBufferAssistantStreamEvents(chatRequest, responsesRequest = {}, config = {}) {
