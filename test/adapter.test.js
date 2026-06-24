@@ -71,8 +71,8 @@ test("有工具时注入 Codex 工作行为约束", () => {
   });
 
   assert.equal(chatRequest.messages[0].role, "system");
-  assert.match(chatRequest.messages[0].content, /必须调用可用的 function tool/);
-  assert.match(chatRequest.messages[0].content, /不要只输出整段代码/);
+  assert.match(chatRequest.messages[0].content, /必须调用 function tool/);
+  assert.match(chatRequest.messages[0].content, /不要输出整段代码让用户复制/);
   assert.match(chatRequest.messages[0].content, /调用 apply_patch/);
 });
 
