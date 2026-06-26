@@ -485,6 +485,83 @@ test("bridge 修复模型输出的 patch 文本为 apply_patch 调用", async (t
   assert.match(JSON.parse(body.output[0].arguments).patch, /\*\*\* Begin Patch/);
 });
 
+test("bridge 会把 custom_tool_call_output 传给上游，便于模型生成已完成收尾", async (t) => {
+  let receivedChatRequest;
+
+  const upstream = http.createServer(async (request, response) => {
+    receivedChatRequest = await readJson(request);
+    writeJson(response, 200, {
+      id: "chatcmpl_patch_done",
+      created: 123,
+      model: receivedChatRequest.model,
+      choices: [
+        {
+          finish_reason: "stop",
+          message: {
+            role: "assistant",
+            content: "README 已编辑完成。"
+          }
+        }
+      ]
+    });
+  });
+
+  await listen(upstream);
+  t.after(() => upstream.close());
+
+  const bridge = http.createServer((request, response) => {
+    handleRequest(request, response, {
+      chatCompletionsUrl: `${serverUrl(upstream)}/v1/chat/completions`,
+      upstreamApiKey: "test-key",
+      strictNativeTools: false
+    }).catch((error) => {
+      writeJson(response, 500, { error: error.message });
+    });
+  });
+
+  await listen(bridge);
+  t.after(() => bridge.close());
+
+  const response = await fetch(`${serverUrl(bridge)}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "codex-model-name",
+      input: [
+        {
+          type: "custom_tool_call",
+          id: "ctc_1",
+          call_id: "ctc_1",
+          name: "apply_patch",
+          input: "*** Begin Patch\n*** Update File: README.md\n@@\n-旧内容\n+新内容\n*** End Patch"
+        },
+        {
+          type: "custom_tool_call_output",
+          call_id: "ctc_1",
+          output: "Success"
+        }
+      ],
+      tools: [
+        {
+          type: "custom",
+          name: "apply_patch",
+          format: { definition: "begin_patch end_patch" }
+        }
+      ]
+    })
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(receivedChatRequest.messages[0].role, "system");
+  assert.equal(receivedChatRequest.messages[1].role, "assistant");
+  assert.equal(receivedChatRequest.messages[1].tool_calls[0].id, "ctc_1");
+  assert.equal(receivedChatRequest.messages[2].role, "tool");
+  assert.equal(receivedChatRequest.messages[2].tool_call_id, "ctc_1");
+  assert.equal(receivedChatRequest.messages[2].content, "Success");
+  assert.equal(body.output_text, "README 已编辑完成。");
+});
+
 function listen(server) {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 }

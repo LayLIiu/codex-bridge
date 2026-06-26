@@ -28,10 +28,11 @@ const CODEX_BRIDGE_BEHAVIOR_PROMPT = [
   "1. 需要操作文件或执行命令时，优先调用 function tool 而不是用自然语言描述。",
   "2. 修改文件时优先用 apply_patch 工具，不要输出整段代码让用户复制。",
   "3. 调用工具前后可以用简短文字说明你在做什么，帮助用户理解操作意图。",
-  "4. 工具参数必须是严格 JSON，基于工具真实结果继续，不要编造输出。"
+  "4. 工具参数必须是严格 JSON，基于工具真实结果继续，不要编造输出。",
+  "5. 工具执行成功后，如果本轮目标已经完成，请明确告诉用户结果，例如“已编辑完成”或“修改已应用”。"
 ].join("\n");
 
-const APPLY_PATCH_BEHAVIOR_PROMPT = "编辑文件时优先调用 apply_patch 工具，可以用简短文字说明修改意图。";
+const APPLY_PATCH_BEHAVIOR_PROMPT = "编辑文件时优先调用 apply_patch 工具，可以用简短文字说明修改意图；补丁成功应用后，请明确告诉用户文件已编辑完成。";
 
 const TOOL_NAME_ALIASES = new Map([
   ["patch", "apply_patch"],
@@ -795,7 +796,7 @@ export function normalizeInputToMessages(input, options = {}) {
       continue;
     }
 
-    if (item.type === "function_call_output") {
+    if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
       messages.push({
         role: "tool",
         tool_call_id: item.call_id ?? item.tool_call_id,
@@ -1239,51 +1240,60 @@ function applyPatchHunksSchema() {
 function remapToolCallItem(item, toolContext = createEmptyToolContext()) {
   if (!item || item.type !== "function_call") return item;
 
-  const namespaceSpec = toolContext.functionTools.get(item.name);
+  const sanitizedItem = sanitizeFunctionCallArguments(item);
+
+  const namespaceSpec = toolContext.functionTools.get(sanitizedItem.name);
   if (namespaceSpec?.namespace) {
     return {
-      ...item,
+      ...sanitizedItem,
       name: namespaceSpec.name,
       namespace: namespaceSpec.namespace
     };
   }
 
-  const customSpec = toolContext.customTools.get(item.name);
-  if (!customSpec) return item;
+  const customSpec = toolContext.customTools.get(sanitizedItem.name);
+  if (!customSpec) return sanitizedItem;
 
   if (customSpec.kind === "apply_patch") {
-    const input = reconstructCustomToolInput(customSpec, item.name, item.arguments ?? "{}");
+    const input = reconstructCustomToolInput(customSpec, sanitizedItem.name, sanitizedItem.arguments ?? "{}");
     return {
       type: "custom_tool_call",
-      id: item.id,
-      call_id: item.call_id,
+      id: sanitizedItem.id,
+      call_id: sanitizedItem.call_id,
       name: customSpec.originalName,
       input,
-      status: item.status ?? "completed"
+      status: sanitizedItem.status ?? "completed"
     };
   }
 
   if (customSpec.kind === "exec" || customSpec.kind === "builtin") {
-    const input = reconstructCustomToolInput(customSpec, item.name, item.arguments ?? "{}");
+    const input = reconstructCustomToolInput(customSpec, sanitizedItem.name, sanitizedItem.arguments ?? "{}");
     return {
       type: "custom_tool_call",
-      id: item.id,
-      call_id: item.call_id,
+      id: sanitizedItem.id,
+      call_id: sanitizedItem.call_id,
       name: customSpec.originalName,
       input,
-      status: item.status ?? "completed"
+      status: sanitizedItem.status ?? "completed"
     };
   }
 
-  const input = reconstructCustomToolInput(customSpec, item.name, item.arguments ?? "{}");
+  const input = reconstructCustomToolInput(customSpec, sanitizedItem.name, sanitizedItem.arguments ?? "{}");
   return {
     type: "custom_tool_call",
-    id: item.id,
-    call_id: item.call_id,
+    id: sanitizedItem.id,
+    call_id: sanitizedItem.call_id,
     name: customSpec.originalName,
     input,
-    status: item.status ?? "completed"
+    status: sanitizedItem.status ?? "completed"
   };
+}
+
+function sanitizeFunctionCallArguments(item) {
+  if (!item || item.type !== "function_call") return item;
+  const sanitizedArguments = sanitizeToolArgumentsByName(item.name, item.arguments);
+  if (sanitizedArguments === item.arguments) return item;
+  return { ...item, arguments: sanitizedArguments };
 }
 
 /**
@@ -1313,13 +1323,16 @@ function reconstructCustomToolInput(spec, upstreamName, rawArguments) {
   }
 
   const parsed = parseJsonObject(rawArguments);
-  if (typeof parsed?.input === "string") return parsed.input;
-  return typeof rawArguments === "string" ? rawArguments : JSON.stringify(rawArguments ?? {});
+  if (typeof parsed?.input === "string") {
+    return sanitizeToolFreeformInput(spec, parsed.input);
+  }
+  const fallback = typeof rawArguments === "string" ? rawArguments : JSON.stringify(rawArguments ?? {});
+  return sanitizeToolFreeformInput(spec, fallback);
 }
 
 function applyPatchInputFromProxyArguments(rawArguments, action) {
   const args = parseJsonObject(rawArguments);
-  if (!args) return typeof rawArguments === "string" ? normalizePatchText(rawArguments) : "";
+  if (!args) return sanitizeApplyPatchText(typeof rawArguments === "string" ? normalizePatchText(rawArguments) : "");
 
   if (typeof args.input === "string" && action) {
     const nested = parseJsonObject(args.input);
@@ -1338,11 +1351,11 @@ function applyPatchInputFromProxyArguments(rawArguments, action) {
   } else if (action === "batch" && Array.isArray(args.operations)) {
     operations.push(...args.operations);
   } else if (typeof args.input === "string") {
-    return normalizePatchText(args.input);
+    return sanitizeApplyPatchText(normalizePatchText(args.input));
   } else if (typeof args.patch === "string") {
-    return normalizePatchText(args.patch);
+    return sanitizeApplyPatchText(normalizePatchText(args.patch));
   } else if (typeof args.raw_patch === "string") {
-    return normalizePatchText(args.raw_patch);
+    return sanitizeApplyPatchText(normalizePatchText(args.raw_patch));
   }
 
   return buildApplyPatchInput(operations.length > 0 ? operations : [{ type: "batch" }]);
@@ -1491,6 +1504,118 @@ function parseJsonObject(value) {
   } catch {
     return null;
   }
+}
+
+function sanitizeToolArgumentsByName(name, rawArguments) {
+  const args = parseJsonObject(rawArguments);
+  if (!args) return rawArguments;
+
+  let changed = false;
+  const next = { ...args };
+  const normalizedName = typeof name === "string" ? name : "";
+
+  if (typeof next.cmd === "string" && isCommandLikeTool(normalizedName)) {
+    const sanitized = sanitizeExecCommandText(next.cmd);
+    if (sanitized !== next.cmd) {
+      next.cmd = sanitized;
+      changed = true;
+    }
+  }
+
+  if (typeof next.command === "string" && isCommandLikeTool(normalizedName)) {
+    const sanitized = sanitizeExecCommandText(next.command);
+    if (sanitized !== next.command) {
+      next.command = sanitized;
+      changed = true;
+    }
+  }
+
+  if (typeof next.input === "string") {
+    const sanitized = sanitizeToolTextField(normalizedName, next.input);
+    if (sanitized !== next.input) {
+      next.input = sanitized;
+      changed = true;
+    }
+  }
+
+  if (typeof next.patch === "string") {
+    const sanitized = sanitizeApplyPatchText(next.patch);
+    if (sanitized !== next.patch) {
+      next.patch = sanitized;
+      changed = true;
+    }
+  }
+
+  if (typeof next.raw_patch === "string") {
+    const sanitized = sanitizeApplyPatchText(next.raw_patch);
+    if (sanitized !== next.raw_patch) {
+      next.raw_patch = sanitized;
+      changed = true;
+    }
+  }
+
+  return changed ? JSON.stringify(next) : rawArguments;
+}
+
+function sanitizeToolFreeformInput(spec, input) {
+  if (typeof input !== "string") return input;
+  if (spec?.kind === "apply_patch" || spec?.originalName === "apply_patch") {
+    return sanitizeApplyPatchText(input);
+  }
+  if (spec?.kind === "exec" || spec?.originalName === "exec_command" || spec?.originalName === "local_shell") {
+    return sanitizeExecCommandText(input);
+  }
+  return input;
+}
+
+function sanitizeToolTextField(name, input) {
+  if (typeof input !== "string") return input;
+  if (name === "apply_patch" || name.startsWith("apply_patch_")) return sanitizeApplyPatchText(input);
+  if (isCommandLikeTool(name)) return sanitizeExecCommandText(input);
+  return input;
+}
+
+function isCommandLikeTool(name) {
+  return ["exec_command", "local_shell", "shell", "bash", "terminal", "run_command", "exec"].includes(name);
+}
+
+function sanitizeExecCommandText(value) {
+  if (typeof value !== "string" || value.trim().length === 0) return value;
+  const normalized = value.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  let index = 0;
+
+  while (index < lines.length) {
+    const trimmed = lines[index].trim();
+    if (!trimmed) {
+      index += 1;
+      continue;
+    }
+    if (isNarrationLine(trimmed)) {
+      index += 1;
+      continue;
+    }
+    break;
+  }
+
+  const sanitized = lines.slice(index).join("\n").trim();
+  return sanitized || value;
+}
+
+function sanitizeApplyPatchText(value) {
+  if (typeof value !== "string" || value.length === 0) return value;
+  const normalized = normalizePatchText(value);
+  const extracted = extractPatchBlock(normalized);
+  return extracted || normalized.trim();
+}
+
+function isNarrationLine(line) {
+  if (!line) return false;
+  if (/^#/.test(line)) return true;
+  if (/^(\/\/|--)\s*/.test(line)) return true;
+  if (/^(我|先|让我|正在|接下来|现在|下面|准备|开始|先来)/.test(line)) return true;
+  if (/^(好的|没问题|收到|我来|稍等|先看|先检查|先查看)/.test(line)) return true;
+  return false;
 }
 
 export function mapTools(responseTools, {

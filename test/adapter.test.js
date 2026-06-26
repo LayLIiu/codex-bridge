@@ -74,6 +74,7 @@ test("有工具时注入 Codex 工作行为约束", () => {
   assert.match(chatRequest.messages[0].content, /优先调用 function tool/);
   assert.match(chatRequest.messages[0].content, /不要输出整段代码让用户复制/);
   assert.match(chatRequest.messages[0].content, /调用 apply_patch/);
+  assert.match(chatRequest.messages[0].content, /已编辑完成|修改已应用/);
 });
 
 test("把 Responses instructions 前置为 Chat system 消息", () => {
@@ -308,6 +309,33 @@ test("保留 function_call 和 function_call_output 的 call_id 顺序", () => {
   ]);
 });
 
+test("custom_tool_call_output 会转成上游 tool 消息，供模型生成收尾说明", () => {
+  const toolContext = buildCodexToolContext([
+    { type: "custom", name: "apply_patch", format: { definition: "begin_patch end_patch" } }
+  ]);
+
+  const messages = normalizeInputToMessages([
+    {
+      type: "custom_tool_call",
+      id: "c_patch",
+      call_id: "c_patch",
+      name: "apply_patch",
+      input: "*** Begin Patch\n*** Update File: README.md\n@@\n-旧\n+新\n*** End Patch"
+    },
+    {
+      type: "custom_tool_call_output",
+      call_id: "c_patch",
+      output: { ok: true, message: "Patch applied" }
+    }
+  ], { toolContext });
+
+  assert.equal(messages[0].role, "assistant");
+  assert.equal(messages[0].tool_calls[0].id, "c_patch");
+  assert.equal(messages[1].role, "tool");
+  assert.equal(messages[1].tool_call_id, "c_patch");
+  assert.equal(messages[1].content, "{\"ok\":true,\"message\":\"Patch applied\"}");
+});
+
 test("把 Chat tool_calls 映射回 Responses function_call", () => {
   const response = fromChatCompletionsResponse({
     id: "chatcmpl_1",
@@ -415,6 +443,81 @@ test("apply_patch proxy tool_call 回映射为 custom_tool_call", () => {
       }
     ]
   }, { responseId: "resp_patch_proxy", toolContext });
+
+  assert.equal(response.output[0].type, "custom_tool_call");
+  assert.equal(response.output[0].name, "apply_patch");
+  assert.equal(response.output[0].input, [
+    "*** Begin Patch",
+    "*** Update File: README.md",
+    "@@",
+    "-旧",
+    "+新",
+    "*** End Patch"
+  ].join("\n"));
+});
+
+test("exec_command 工具参数前的说明文字会被清理，但仍保留工具调用", () => {
+  const response = fromChatCompletionsResponse({
+    id: "chatcmpl_exec_preface",
+    created: 123,
+    model: "glm-5",
+    choices: [
+      {
+        finish_reason: "tool_calls",
+        message: {
+          role: "assistant",
+          tool_calls: [
+            {
+              id: "call_exec",
+              type: "function",
+              function: {
+                name: "exec_command",
+                arguments: JSON.stringify({
+                  cmd: "# 先看一下项目结构\n# 然后列目录\nls -la"
+                })
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }, { responseId: "resp_exec_preface" });
+
+  assert.equal(response.output[0].type, "function_call");
+  assert.equal(response.output[0].name, "exec_command");
+  assert.deepEqual(JSON.parse(response.output[0].arguments), { cmd: "ls -la" });
+});
+
+test("apply_patch 原始 patch 参数前的说明文字会被清理，但仍保留 custom_tool_call", () => {
+  const toolContext = buildCodexToolContext([
+    { type: "custom", name: "apply_patch", format: { definition: "begin_patch end_patch" } }
+  ]);
+
+  const response = fromChatCompletionsResponse({
+    id: "chatcmpl_patch_preface",
+    created: 123,
+    model: "glm-5",
+    choices: [
+      {
+        finish_reason: "tool_calls",
+        message: {
+          role: "assistant",
+          tool_calls: [
+            {
+              id: "call_patch_preface",
+              type: "function",
+              function: {
+                name: "apply_patch_batch",
+                arguments: JSON.stringify({
+                  raw_patch: "我来修改这个文件\n*** Begin Patch\n*** Update File: README.md\n@@\n-旧\n+新\n*** End Patch"
+                })
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }, { responseId: "resp_patch_preface", toolContext });
 
   assert.equal(response.output[0].type, "custom_tool_call");
   assert.equal(response.output[0].name, "apply_patch");
